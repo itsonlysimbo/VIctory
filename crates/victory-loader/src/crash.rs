@@ -17,7 +17,7 @@ use windows_sys::Win32::Foundation::{
 };
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, RtlLookupFunctionEntry,
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, M128A, RtlLookupFunctionEntry,
     RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
 };
 use windows_sys::Win32::System::LibraryLoader::{
@@ -134,8 +134,84 @@ const FATAL: [i32; 6] = [
     EXCEPTION_BREAKPOINT,
 ];
 
+/// Console CPUs are Zen 2: titles use AMD-only instructions Intel CPUs
+/// lack. Does their job instead: `clzero` (`0f 01 fc`) zeroes the 64-byte
+/// line at `rax`; `monitorx`/`mwaitx` (`0f 01 fa`/`fb`) are wait hints, so
+/// a spin loop around them works with mwaitx as a yield.
+unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
+    // SAFETY: the system passes valid exception pointers; the faulting
+    // instruction's bytes are readable, as the CPU just fetched them.
+    unsafe {
+        let record = &*(*info).ExceptionRecord;
+        let context = &mut *(*info).ContextRecord;
+        if record.ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION {
+            return false;
+        }
+        let code = context.Rip as *const u8;
+        match code.cast::<[u8; 3]>().read_unaligned() {
+            [0x0f, 0x01, 0xfc] => ((context.Rax & !63) as *mut u8).write_bytes(0, 64),
+            [0x0f, 0x01, 0xfa] => {}
+            [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
+            _ => {
+                let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {
+                    return false;
+                };
+                context.Rip += len as u64;
+                return true;
+            }
+        }
+        context.Rip += 3;
+    }
+    true
+}
+
+/// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
+/// the saved XMM registers; returns the instruction's length.
+unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
+    // SAFETY: the caller's code bytes are readable up to the instruction's end.
+    let b = |i: usize| unsafe { code.add(i).read() };
+    let prefix = b(0);
+    let (rex, at) = if b(1) & 0xf0 == 0x40 { (b(1), 2) } else { (0, 1) };
+    if !matches!(prefix, 0x66 | 0xf2) || b(at) != 0x0f || !matches!(b(at + 1), 0x78 | 0x79) {
+        return None;
+    }
+    let modrm = b(at + 2);
+    if modrm >> 6 != 3 {
+        return None;
+    }
+    let dst = usize::from((modrm >> 3) & 7 | (rex & 4) << 1);
+    let src = usize::from(modrm & 7 | (rex & 1) << 3);
+    let immediate = b(at + 1) == 0x78;
+    let (fields, len) = if immediate {
+        ((b(at + 3), b(at + 4)), at + 5)
+    } else {
+        // extrq reads its fields from src's low half, insertq from its high.
+        let f = if prefix == 0x66 { xmm[src].Low } else { xmm[src].High as u64 };
+        ((f as u8, (f >> 8) as u8), at + 3)
+    };
+    let (n, at_bit) = (u32::from(fields.0 & 63), u32::from(fields.1 & 63));
+    let bits = if n == 0 { 64 } else { n };
+    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    if prefix == 0x66 {
+        // extrq: register form takes its fields from src, works on dst.
+        if immediate && (modrm >> 3) & 7 != 0 {
+            return None;
+        }
+        let target = if immediate { src } else { dst };
+        xmm[target].Low = (xmm[target].Low >> at_bit) & mask;
+    } else {
+        let value = (xmm[src].Low & mask) << at_bit;
+        xmm[dst].Low = xmm[dst].Low & !(mask << at_bit) | value;
+    }
+    Some(len)
+}
+
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers.
+    if unsafe { emulate_amd_only(info) } {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
+    // SAFETY: as above.
     if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
         // SAFETY: as above.
         unsafe { report("first-chance exception", info, false) };
@@ -379,5 +455,37 @@ mod tests {
             .collect();
         let system: Vec<_> = walked[1..].iter().map(|&f| f as usize).collect();
         assert_eq!(ours, system);
+    }
+
+    #[test]
+    fn clzero_zeroes_its_line_on_any_cpu() {
+        report_crashes();
+        #[repr(align(64))]
+        struct Line([u8; 128]);
+        let mut line = Line([0xff; 128]);
+        let at = line.0.as_mut_ptr().wrapping_add(5); // inside the first line
+        // SAFETY: clzero writes only the 64-byte line holding `at`, ours.
+        unsafe { std::arch::asm!(".byte 0x0f, 0x01, 0xfc", in("rax") at) };
+        assert!(line.0[..64].iter().all(|&b| b == 0));
+        assert!(line.0[64..].iter().all(|&b| b == 0xff));
+        // insertq xmm0, xmm1, len 16, at 16; then extrq xmm0, len 8, at 20.
+        let out: u64;
+        // SAFETY: touches only the named registers.
+        unsafe {
+            std::arch::asm!(
+                "movq xmm0, {a}", "movq xmm1, {b}",
+                ".byte 0xf2, 0x0f, 0x78, 0xc1, 0x10, 0x10",
+                "movq {a}, xmm0",
+                ".byte 0x66, 0x0f, 0x78, 0xc0, 0x08, 0x14",
+                "movq {b}, xmm0",
+                a = inout(reg) 0x1111_2222_3333_4444u64 => _, b = inout(reg) 0xabcdu64 => out,
+                out("xmm0") _, out("xmm1") _)
+        };
+        assert_eq!(out, 0xbc); // 0x1111_2222_abcd_4444 >> 20, 8 bits
+        // SAFETY: monitorx/mwaitx are wait hints that write no memory.
+        unsafe {
+            std::arch::asm!(".byte 0x0f, 0x01, 0xfa", ".byte 0x0f, 0x01, 0xfb",
+                in("rax") at, in("ecx") 0, in("edx") 0)
+        };
     }
 }
