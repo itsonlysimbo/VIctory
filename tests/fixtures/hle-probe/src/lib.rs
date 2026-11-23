@@ -2,6 +2,11 @@
 //! exist on a PC, which is exactly the situation victory-loader handles.
 //! Loaded normally, this DLL would fail with "module not found".
 
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+const DLL_THREAD_ATTACH: u32 = 2;
+
 #[link(name = "xgameruntime", kind = "raw-dylib")]
 unsafe extern "system" {
     fn XGameRuntimeInitialize() -> i32;
@@ -69,4 +74,36 @@ pub extern "system" fn probe_delayed() -> u32 {
 #[unsafe(no_mangle)]
 pub extern "system" fn probe_missing() -> u64 {
     unsafe { VIctoryProbeNotImplemented(42) }
+}
+
+static TLS_THREAD_STARTS: AtomicU32 = AtomicU32::new(0);
+static MAIN_THREAD_STARTS: AtomicU32 = AtomicU32::new(0);
+
+/// A TLS callback, as titles have: counts thread starts.
+unsafe extern "system" fn on_thread(_: *mut c_void, reason: u32, _: *mut c_void) {
+    if reason == DLL_THREAD_ATTACH {
+        TLS_THREAD_STARTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[used]
+#[unsafe(link_section = ".CRT$XLB")]
+static ON_THREAD: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) = on_thread;
+
+/// Called by the CRT's DLL entry point: counts thread starts too.
+#[unsafe(no_mangle)]
+pub extern "system" fn DllMain(_: *mut c_void, reason: u32, _: *mut c_void) -> i32 {
+    if reason == DLL_THREAD_ATTACH {
+        MAIN_THREAD_STARTS.fetch_add(1, Ordering::Relaxed);
+    }
+    1
+}
+
+/// Thread starts seen by the TLS callback (high half) and `DllMain` (low).
+#[unsafe(no_mangle)]
+pub extern "system" fn probe_thread_starts() -> u64 {
+    // SAFETY: reading our own static keeps the linker from dropping it.
+    unsafe { std::ptr::from_ref(&ON_THREAD).read_volatile() };
+    u64::from(TLS_THREAD_STARTS.load(Ordering::Relaxed)) << 32
+        | u64::from(MAIN_THREAD_STARTS.load(Ordering::Relaxed))
 }

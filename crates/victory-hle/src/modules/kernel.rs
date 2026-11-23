@@ -180,6 +180,12 @@ pub extern "system" fn FreeLibrary(module: *mut c_void) -> i32 {
     host::free_library(module)
 }
 
+/// Title images hear of thread starts and ends from us, not from the
+/// Windows loader (`victory_loader::disable_thread_calls`).
+pub extern "system" fn DisableThreadLibraryCalls(module: *mut c_void) -> i32 {
+    host::disable_thread_library_calls(module)
+}
+
 /// Title debug output goes to our log (no debugger needs to be attached).
 pub extern "system" fn OutputDebugStringA(text: *const u8) {
     if !text.is_null() {
@@ -293,6 +299,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(LoadLibraryW),
             hle_export!(GetProcAddress),
             hle_export!(FreeLibrary),
+            hle_export!(DisableThreadLibraryCalls),
             hle_export!(OutputDebugStringA),
             hle_export!(OutputDebugStringW),
             hle_export!(exit),
@@ -311,8 +318,8 @@ mod host {
     use windows_sys::Win32::Foundation::{FreeLibrary, SetLastError};
     use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
     use windows_sys::Win32::System::LibraryLoader::{
-        GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleA, GetModuleHandleW, GetProcAddress,
-        LoadLibraryExA, LoadLibraryExW,
+        DisableThreadLibraryCalls, GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleA,
+        GetModuleHandleW, GetProcAddress, LoadLibraryExA, LoadLibraryExW,
     };
     use windows_sys::Win32::System::Threading::TerminateProcess;
 
@@ -373,6 +380,14 @@ mod host {
     pub(super) fn free_library(module: *mut c_void) -> i32 {
         // SAFETY: see above.
         unsafe { FreeLibrary(module) }
+    }
+
+    pub(super) fn disable_thread_library_calls(module: *mut c_void) -> i32 {
+        match victory_loader::disable_thread_calls(module as usize) {
+            Some(done) => i32::from(done),
+            // SAFETY: see above.
+            None => unsafe { DisableThreadLibraryCalls(module) },
+        }
     }
 
     pub(super) fn exit(code: i32) -> ! {
@@ -445,6 +460,10 @@ mod host {
     }
 
     pub(super) fn free_library(_: *mut c_void) -> i32 {
+        0
+    }
+
+    pub(super) fn disable_thread_library_calls(_: *mut c_void) -> i32 {
         0
     }
 

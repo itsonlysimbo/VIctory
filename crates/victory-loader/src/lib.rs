@@ -18,12 +18,15 @@
 //!    anything unresolved to a generated stub that reports exactly what
 //!    was called;
 //! 5. initialise the title's DLLs, then run TLS callbacks and the entry
-//!    point on a thread with the stack size the image asks for.
+//!    point on a thread with the stack size the image asks for; from then
+//!    on, pass every thread start and end on to the attached images.
 
 #[cfg(windows)]
 mod crash;
 pub mod prepare;
 pub mod resolve;
+#[cfg(windows)]
+mod threads;
 #[cfg(windows)]
 mod thunks;
 #[cfg(windows)]
@@ -35,6 +38,8 @@ mod windows;
 pub use crash::{locate, report_crashes};
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
+#[cfg(windows)]
+pub use threads::disable_thread_calls;
 #[cfg(windows)]
 pub use thunks::{UnimplementedPolicy, unimplemented_call_count};
 #[cfg(windows)]

@@ -178,6 +178,35 @@ fn loads_binds_and_calls_probe() {
         assert_eq!(f(), 0);
         assert_eq!(unimplemented_call_count(), before + 1);
 
+        // Once attached, every thread start reaches its TLS callback and
+        // DllMain (other tests may start threads too, hence at least one).
+        assert!(
+            image
+                .info()
+                .tls
+                .as_ref()
+                .is_some_and(|t| !t.callback_rvas.is_empty())
+        );
+        image.attach().unwrap();
+        let f: extern "system" fn() -> u64 = std::mem::transmute(call("probe_thread_starts"));
+        let before = f();
+        std::thread::spawn(|| {}).join().unwrap();
+        let after = f();
+        assert!(
+            after >> 32 > before >> 32,
+            "TLS callback: {before:#x} → {after:#x}"
+        );
+        assert!(
+            after as u32 > before as u32,
+            "DllMain: {before:#x} → {after:#x}"
+        );
+        // It has static TLS, so Windows would refuse too.
+        assert_eq!(
+            victory_loader::disable_thread_calls(image.base()),
+            Some(false)
+        );
+        assert_eq!(victory_loader::disable_thread_calls(1), None);
+
         image.unload();
     }
 }

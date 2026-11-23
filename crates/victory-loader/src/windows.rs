@@ -87,6 +87,7 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         path = %loaded.path.display(),
         "image mapped"
     );
+    crate::threads::mapped(&loaded);
     Ok(loaded)
 }
 
@@ -318,26 +319,39 @@ impl LoadedImage {
     }
 
     /// Initialises a DLL as the Windows loader would: its TLS callbacks,
-    /// then `DllMain(DLL_PROCESS_ATTACH)`.
+    /// then `DllMain(DLL_PROCESS_ATTACH)`. From then on it hears of every
+    /// thread start and end (see `threads`).
     ///
     /// # Safety
     /// Runs title code. Imports must be bound first, and the DLLs this one
     /// depends on attached.
     pub unsafe fn attach(&self) -> Result<()> {
         // SAFETY: forwarded from the caller.
-        unsafe { self.run_tls_callbacks(DLL_PROCESS_ATTACH) };
-        if self.info.entry_rva == 0 {
-            return Ok(());
+        if unsafe { self.notify(DLL_PROCESS_ATTACH, true) } == Some(0) {
+            bail!("DllMain returned FALSE");
+        }
+        crate::threads::attached(self.base());
+        Ok(())
+    }
+
+    /// Runs the image's TLS callbacks with `reason`, then, if `dll_main` and
+    /// the image is a DLL with an entry point, its `DllMain`, whose result
+    /// is returned.
+    ///
+    /// # Safety
+    /// Runs title code. Imports must be bound first.
+    pub(crate) unsafe fn notify(&self, reason: u32, dll_main: bool) -> Option<i32> {
+        // SAFETY: forwarded from the caller.
+        unsafe { self.run_tls_callbacks(reason) };
+        if !dll_main || !self.info.is_dll() || self.info.entry_rva == 0 {
+            return None;
         }
         type DllMain = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> i32;
         // SAFETY: the entry RVA came from the original image header.
         let main: DllMain =
             unsafe { std::mem::transmute(self.base() + self.info.entry_rva as usize) };
         // SAFETY: forwarded from the caller.
-        if unsafe { main(self.module, DLL_PROCESS_ATTACH, std::ptr::null_mut()) } == 0 {
-            bail!("DllMain returned FALSE");
-        }
-        Ok(())
+        Some(unsafe { main(self.module, reason, std::ptr::null_mut()) })
     }
 
     /// Starts the title: on a new thread with the stack size from the image
@@ -367,6 +381,7 @@ impl LoadedImage {
                 }
                 // SAFETY: forwarded from the caller of `spawn_main`.
                 unsafe { self.run_tls_callbacks(DLL_PROCESS_ATTACH) };
+                crate::threads::attached(self.base());
                 type Entry = unsafe extern "system" fn(*mut c_void) -> u32;
                 // SAFETY: the entry RVA came from the original image header.
                 let entry: Entry =
@@ -383,6 +398,7 @@ impl LoadedImage {
     /// No title code may be running or run later, and no pointer into the
     /// image may be used afterwards.
     pub unsafe fn unload(self) {
+        crate::threads::unmapped(self.base());
         // SAFETY: guaranteed by the caller.
         unsafe { FreeLibrary(self.module) };
     }
