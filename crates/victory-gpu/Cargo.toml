@@ -1,0 +1,11 @@
+[package]
+name = "victory-gpu"
+description = "D3D12.X command streams and GPU memory, translated onto host D3D12."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

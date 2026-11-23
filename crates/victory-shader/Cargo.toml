@@ -1,0 +1,15 @@
+[package]
+name = "victory-shader"
+description = "Xbox shader containers (DXBC/DXIL + precompiled GFX10) to host shaders."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+miniz_oxide.workspace = true
+
+[lints]
+workspace = true
