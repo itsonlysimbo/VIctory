@@ -2,8 +2,8 @@
 //!
 //! Instructions are found by following control flow from offset 0, not by a
 //! linear sweep: compilers place data (constant tables) in the code region
-//! after the end of the program. Operand fields are not decoded yet; each
-//! instruction keeps its raw dwords.
+//! after the end of the program. [`Instruction::fields`] decodes the operand
+//! fields and [`Instruction::text`] prints them in AMD's SP3 syntax.
 //!
 //! Encodings by the top bits of the first dword:
 //!
@@ -14,7 +14,11 @@
 //! 111000 MUBUF   111010 MTBUF  111100 MIMG  111101 SMEM  111110 EXP
 //! ```
 
+mod fields;
 mod opcodes;
+mod sp3;
+
+pub use fields::{Cache, Dpp, Fields, Operand, Sdwa, Valu};
 
 use std::collections::BTreeMap;
 

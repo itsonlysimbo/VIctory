@@ -76,7 +76,9 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                                         *t.unnamed.entry(key).or_default() += 1;
                                     }
                                     if disasm {
-                                        listing.extend(insts.iter().map(format_instruction));
+                                        listing.extend(
+                                            insts.iter().map(|i| format_instruction(i, n.wave64)),
+                                        );
                                     }
                                 }
                                 Err(e) => {
@@ -166,11 +168,11 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
     Ok(())
 }
 
-fn format_instruction(i: &Instruction) -> String {
+fn format_instruction(i: &Instruction, wave64: bool) -> String {
     let words: Vec<_> = i.words.iter().map(|w| format!("{w:08X}")).collect();
-    let name = match i.name() {
-        Some(n) => n.to_owned(),
+    let text = match i.name() {
+        Some(_) => i.text(wave64),
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
-    format!("    {:06x}: {:<44} {name}", i.offset, words.join(" "))
+    format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
 }
