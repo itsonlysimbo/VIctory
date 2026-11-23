@@ -978,8 +978,12 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
 /// Where PC code and the console differ by design, the translation must
 /// give the console's results: float-to-int conversions saturate and give
 /// 0 for NaN (`v_cvt_i32/u32_f32`), the legacy multiply the compiler
-/// uses for `*` gives 0 for 0 × NaN, and `frac` never reaches 1.0 (it gives
-/// the largest value below; some hosts' own `frac` gives 1.0).
+/// uses for `*` gives 0 for 0 × NaN, `frac` never reaches 1.0 (it gives
+/// the largest value below; some hosts' own `frac` gives 1.0), and sine
+/// and cosine take turns: the sine of a half turn and the cosine of a
+/// quarter turn are exactly +0 (the host's functions of the rounded angle
+/// give about 1e-7). The compiler takes whole turns off itself, so large
+/// angles cannot be tried from here.
 #[test]
 fn float_semantics_are_the_consoles() {
     use super::host::{Dispatch, View};
@@ -1001,6 +1005,9 @@ fn float_semantics_are_the_consoles() {
             outb.Store(32 + 4 * i, asuint(x * k.w));
             float y = i == 0 ? k.w - 1e-10 : i == 1 ? k.z : i == 2 ? k.w - 1e-8 : k.z + 0.25;
             outb.Store(48 + 4 * i, asuint(frac(y)));
+            float r = i == 0 ? k.w + 3.14159274 : i == 1 ? k.w + 1.0
+                    : i == 2 ? k.w - 3.14159274 : k.w + 1.57079637;
+            outb.Store(64 + 4 * i, asuint(i == 3 ? cos(r) : sin(r)));
         }"#;
     let cs = translate(&compile(&console, &dir, src, "cs", "cs_6_5")).unwrap();
     let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -1012,7 +1019,7 @@ fn float_semantics_are_the_consoles() {
         View::Texture(1, 1, &[[0.0; 4]]),
         View::Texture(1, 1, &[[0.0; 4]]),
         View::Texture(1, 1, &[[0.0; 4]]),
-        View::RawUav(16),
+        View::RawUav(20),
         View::TextureUav(1, 1),
     ];
     let out = host
@@ -1029,7 +1036,7 @@ fn float_semantics_are_the_consoles() {
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(
-        out[0],
+        out[0][..16],
         [
             0x7FFF_FFFF,
             0x8000_0000,
@@ -1049,6 +1056,12 @@ fn float_semantics_are_the_consoles() {
             0.75f32.to_bits(), // frac
         ]
     );
+    // sin(pi), sin(-pi) and cos(pi/2): the compiler turns radians into
+    // exactly 0.5, -0.5 and 0.25 turns.
+    assert_eq!([out[0][16], out[0][18], out[0][19]], [0, 0, 0]);
+    // An ordinary angle is untouched: sin(1 rad).
+    let one = f32::from_bits(out[0][17]);
+    assert!((one - 0.841_470_96).abs() < 1e-4, "{one}");
 }
 
 /// Equal bits, both zero (the console's legacy multiply gives +0 where PC

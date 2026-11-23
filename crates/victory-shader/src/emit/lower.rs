@@ -1418,6 +1418,32 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, over, k, r)
     }
 
+    /// Sine, or cosine, of an angle in turns, as the hardware takes it. The
+    /// whole turns are taken off first (`x - round_even(x)`, exact, within
+    /// half a turn), so a large angle keeps its fraction; scaling to radians
+    /// first rounds it away. A zero passes unreduced (the sine of -0 is -0).
+    /// The sine of a half turn and the cosine of a quarter turn are exactly
+    /// +0 on the hardware, where the host's function of the rounded angle
+    /// gives about 1e-7. Infinities and NaN give NaN.
+    /// shortcut: below 2^-12 turns the hardware scales by a slightly
+    /// different constant than 2π (a last-place difference).
+    fn trig_turns(&mut self, x: V, cosine: bool) -> V {
+        let c = self.cur;
+        let zero = self.s.m.f32(0);
+        let whole = self.unary(26, x);
+        let part = self.s.m.bin(c, Bin::Sub, x, whole);
+        let is_zero = self.s.m.cmp(c, pred::OEQ, x, zero);
+        let part = self.s.m.select(c, is_zero, x, part);
+        let k = self.s.m.f32(TWO_PI.to_bits());
+        let angle = self.s.m.bin(c, Bin::Mul, part, k);
+        let r = self.unary(if cosine { 12 } else { 13 }, angle);
+        let at = if cosine { 0.25f32 } else { 0.5 };
+        let at = self.s.m.f32(at.to_bits());
+        let size = self.unary(6, part);
+        let exact = self.s.m.cmp(c, pred::OEQ, size, at);
+        self.s.m.select(c, exact, zero, r)
+    }
+
     /// The high dword of a 32 × 32-bit product.
     fn mul_hi(&mut self, a: V, b: V, signed: bool) -> V {
         let c = self.cur;
@@ -3669,7 +3695,7 @@ impl<'a> Lower<'a> {
             "v_rsq_f32" | "v_sqrt_f32" | "v_log_f32" | "v_exp_f32" | "v_fract_f32"
             | "v_trunc_f32" | "v_floor_f32" | "v_ceil_f32" | "v_rndne_f32" | "v_sin_f32"
             | "v_cos_f32" => {
-                let mut a = f(self, 0)?;
+                let a = f(self, 0)?;
                 let op = match name {
                     "v_rsq_f32" => 25,
                     "v_sqrt_f32" => 24,
@@ -3683,15 +3709,10 @@ impl<'a> Lower<'a> {
                     "v_sin_f32" => 13,
                     _ => 12,
                 };
-                if op == 13 || op == 12 {
-                    // The hardware takes revolutions.
-                    let k = self.s.m.f32(TWO_PI.to_bits());
-                    a = self.s.m.bin(c, Bin::Mul, a, k);
-                }
-                let r = if op == 22 {
-                    self.fract(a, f32::from_bits(0x3F7F_FFFF))
-                } else {
-                    self.unary(op, a)
+                let r = match op {
+                    12 | 13 => self.trig_turns(a, op == 12),
+                    22 => self.fract(a, f32::from_bits(0x3F7F_FFFF)),
+                    _ => self.unary(op, a),
                 };
                 float(self, r)
             }
@@ -4275,7 +4296,7 @@ impl<'a> Lower<'a> {
                     self.s.m.bin(c, Bin::SDiv, one, a)
                 }
                 _ => {
-                    let mut a = self.half_fsrc(inst, 0)?;
+                    let a = self.half_fsrc(inst, 0)?;
                     let op = match name {
                         "v_sqrt_f16" => 24,
                         "v_rsq_f16" => 25,
@@ -4289,15 +4310,11 @@ impl<'a> Lower<'a> {
                         "v_sin_f16" => 13,
                         _ => 12,
                     };
-                    if op == 13 || op == 12 {
-                        let k = self.s.m.f32(TWO_PI.to_bits());
-                        a = self.s.m.bin(c, Bin::Mul, a, k);
-                    }
-                    if op == 22 {
+                    match op {
+                        12 | 13 => self.trig_turns(a, op == 12),
                         // 0x3bff as a half: 1 - 2^-11.
-                        self.fract(a, 1.0 - 1.0 / 2048.0)
-                    } else {
-                        self.unary(op, a)
+                        22 => self.fract(a, 1.0 - 1.0 / 2048.0),
+                        _ => self.unary(op, a),
                     }
                 }
             };
