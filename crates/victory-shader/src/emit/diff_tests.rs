@@ -977,8 +977,9 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
 
 /// Where PC code and the console differ by design, the translation must
 /// give the console's results: float-to-int conversions saturate and give
-/// 0 for NaN (`v_cvt_i32/u32_f32`), and the legacy multiply the compiler
-/// uses for `*` gives 0 for 0 × NaN.
+/// 0 for NaN (`v_cvt_i32/u32_f32`), the legacy multiply the compiler
+/// uses for `*` gives 0 for 0 × NaN, and `frac` never reaches 1.0 (it gives
+/// the largest value below; some hosts' own `frac` gives 1.0).
 #[test]
 fn float_semantics_are_the_consoles() {
     use super::host::{Dispatch, View};
@@ -998,6 +999,8 @@ fn float_semantics_are_the_consoles() {
             outb.Store(4 * i, asuint(int(x)));
             outb.Store(16 + 4 * i, uint(x));
             outb.Store(32 + 4 * i, asuint(x * k.w));
+            float y = i == 0 ? k.w - 1e-10 : i == 1 ? k.z : i == 2 ? k.w - 1e-8 : k.z + 0.25;
+            outb.Store(48 + 4 * i, asuint(frac(y)));
         }"#;
     let cs = translate(&compile(&console, &dir, src, "cs", "cs_6_5")).unwrap();
     let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -1009,7 +1012,7 @@ fn float_semantics_are_the_consoles() {
         View::Texture(1, 1, &[[0.0; 4]]),
         View::Texture(1, 1, &[[0.0; 4]]),
         View::Texture(1, 1, &[[0.0; 4]]),
-        View::RawUav(12),
+        View::RawUav(16),
         View::TextureUav(1, 1),
     ];
     let out = host
@@ -1040,6 +1043,10 @@ fn float_semantics_are_the_consoles() {
             0,
             0,
             0, // x * 0, NaN included
+            0x3F7F_FFFF,
+            0.5f32.to_bits(),
+            0x3F7F_FFFF,
+            0.75f32.to_bits(), // frac
         ]
     );
 }

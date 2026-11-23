@@ -1356,7 +1356,9 @@ impl<'a> Lower<'a> {
     }
 
     /// `(a >> off[4:0]) & ((1 << width) - 1)`, sign-extended from the field's
-    /// top bit when `signed`; widths from 32 on take every bit.
+    /// top bit when `signed`; widths from 32 on take every bit. A signed
+    /// field that runs past bit 31 extends from bit 31, as the hardware
+    /// does: the shift is arithmetic then.
     fn bfe(&mut self, a: V, off: V, width: V, signed: bool) -> V {
         let c = self.cur;
         let (k31, k32, zero, one, ones) = (
@@ -1367,7 +1369,8 @@ impl<'a> Lower<'a> {
             self.s.m.i32(u32::MAX),
         );
         let off = self.s.m.bin(c, Bin::And, off, k31);
-        let shifted = self.s.m.bin(c, Bin::LShr, a, off);
+        let shift = if signed { Bin::AShr } else { Bin::LShr };
+        let shifted = self.s.m.bin(c, shift, a, off);
         let full = self.s.m.cmp(c, pred::IUGE, width, k32);
         let w = self.s.m.bin(c, Bin::And, width, k31);
         let mask = self.s.m.bin(c, Bin::Shl, one, w);
@@ -1385,6 +1388,34 @@ impl<'a> Lower<'a> {
         let is0 = self.s.m.cmp(c, pred::EQ, w, zero);
         let keep = self.s.m.bin(c, Bin::Or, full, is0);
         self.s.m.select(c, keep, r, t)
+    }
+
+    /// The median of three. With a NaN among them the hardware gives the
+    /// minimum of the three instead (the host's minimum skips NaNs, so that
+    /// is the smallest number among them).
+    fn med3(&mut self, a: V, b: V, third: V) -> V {
+        let c = self.cur;
+        let lo = self.binary(36, a, b);
+        let hi = self.binary(35, a, b);
+        let t = self.binary(36, hi, third);
+        let median = self.binary(35, lo, t);
+        let least = self.binary(36, lo, third);
+        let ab = self.s.m.cmp(c, pred::UNO, a, b);
+        let nan3 = self.s.m.cmp(c, pred::UNO, third, third);
+        let nan = self.s.m.bin(c, Bin::Or, ab, nan3);
+        self.s.m.select(c, nan, least, median)
+    }
+
+    /// `a - floor(a)`, which on the hardware never reaches 1.0: where it
+    /// would round to it (a tiny negative `a`), the result is `below_one`,
+    /// the largest value under 1.0 in the operation's width. Hosts differ
+    /// here (some give 1.0). NaN stays NaN.
+    fn fract(&mut self, a: V, below_one: f32) -> V {
+        let c = self.cur;
+        let r = self.unary(22, a);
+        let k = self.s.m.f32(below_one.to_bits());
+        let over = self.s.m.cmp(c, pred::OGT, r, k);
+        self.s.m.select(c, over, k, r)
     }
 
     /// The high dword of a 32 × 32-bit product.
@@ -3624,12 +3655,7 @@ impl<'a> Lower<'a> {
                         let t = self.binary(36, a, bb);
                         self.binary(36, t, cc)
                     }
-                    _ => {
-                        let lo = self.binary(36, a, bb);
-                        let hi = self.binary(35, a, bb);
-                        let t = self.binary(36, hi, cc);
-                        self.binary(35, lo, t)
-                    }
+                    _ => self.med3(a, bb, cc),
                 };
                 float(self, r)
             }
@@ -3662,7 +3688,11 @@ impl<'a> Lower<'a> {
                     let k = self.s.m.f32(TWO_PI.to_bits());
                     a = self.s.m.bin(c, Bin::Mul, a, k);
                 }
-                let r = self.unary(op, a);
+                let r = if op == 22 {
+                    self.fract(a, f32::from_bits(0x3F7F_FFFF))
+                } else {
+                    self.unary(op, a)
+                };
                 float(self, r)
             }
             "v_cvt_i32_f32" | "v_cvt_u32_f32" | "v_cvt_flr_i32_f32" | "v_cvt_rpi_i32_f32" => {
@@ -4221,12 +4251,7 @@ impl<'a> Lower<'a> {
                     let t = self.binary(36, a, b);
                     self.binary(36, t, acc)
                 }
-                _ => {
-                    let lo = self.binary(36, a, b);
-                    let hi = self.binary(35, a, b);
-                    let t = self.binary(36, hi, acc);
-                    self.binary(35, lo, t)
-                }
+                _ => self.med3(a, b, acc),
             };
             return float_result(self, r);
         }
@@ -4268,7 +4293,12 @@ impl<'a> Lower<'a> {
                         let k = self.s.m.f32(TWO_PI.to_bits());
                         a = self.s.m.bin(c, Bin::Mul, a, k);
                     }
-                    self.unary(op, a)
+                    if op == 22 {
+                        // 0x3bff as a half: 1 - 2^-11.
+                        self.fract(a, 1.0 - 1.0 / 2048.0)
+                    } else {
+                        self.unary(op, a)
+                    }
                 }
             };
             return float_result(self, r);
