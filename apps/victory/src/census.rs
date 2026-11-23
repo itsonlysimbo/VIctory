@@ -68,6 +68,7 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
                         match class {
                             Some(Provenance::Hle) => stats.hle += 1,
                             Some(Provenance::Host) => stats.host += 1,
+                            Some(Provenance::Title) => unreachable!("census maps no title DLLs"),
                             None => stats.missing += 1,
                         }
                     }

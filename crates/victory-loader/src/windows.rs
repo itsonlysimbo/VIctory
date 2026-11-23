@@ -1,8 +1,10 @@
 //! Loading a prepared image as a real Windows module and binding it.
 
+use std::collections::HashSet;
 use std::ffi::{CString, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use anyhow::{Context, Result, bail};
@@ -12,7 +14,7 @@ use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
 use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
 
 use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
-use crate::{DLL_PROCESS_ATTACH, ImportResolver, PreparedImage, Provenance, Resolution};
+use crate::{DLL_PROCESS_ATTACH, ImportResolver, PreparedImage, Provenance, Resolution, prepare};
 
 /// A title image mapped into this process.
 #[derive(Debug)]
@@ -39,6 +41,7 @@ pub struct MissingImport {
 pub struct BindReport {
     pub hle: usize,
     pub host: usize,
+    pub title: usize,
     pub missing: Vec<MissingImport>,
 }
 
@@ -72,6 +75,11 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         path,
         info: prepared.info.clone(),
     };
+    // A DLL indexes its TLS properly; only an exe assumes index 0.
+    if !loaded.info.is_dll() {
+        // SAFETY: just mapped, and no title code has run.
+        unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
+    }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
         preferred = format_args!("{:#x}", loaded.info.image_base),
@@ -79,6 +87,67 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         "image mapped"
     );
     Ok(loaded)
+}
+
+/// Maps the DLLs the title ships in `title_dir` that `main` imports,
+/// directly or through each other, in initialisation order (dependencies
+/// first). Only DLL names `wanted` accepts are considered, so DLLs the host
+/// or our runtime provide stay with them. Imports are not bound.
+pub fn load_title_dlls(
+    main: &ImageInfo,
+    title_dir: &Path,
+    cache_dir: &Path,
+    wanted: &dyn Fn(&str) -> bool,
+) -> Result<Vec<(String, LoadedImage)>> {
+    fn visit(
+        info: &ImageInfo,
+        dirs: (&Path, &Path),
+        wanted: &dyn Fn(&str) -> bool,
+        seen: &mut HashSet<String>,
+        loaded: &mut Vec<(String, LoadedImage)>,
+    ) -> Result<()> {
+        for module in info.imports.iter().chain(&info.delay_imports) {
+            let name = module.dll.to_ascii_lowercase();
+            let path = dirs.0.join(&name);
+            if !seen.insert(name.clone()) || !wanted(&name) || !path.is_file() {
+                continue;
+            }
+            let original =
+                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            let image = load(&prepare(&original)?, dirs.1)
+                .with_context(|| format!("loading {}", path.display()))?;
+            visit(&image.info, dirs, wanted, seen, loaded)?;
+            loaded.push((name, image));
+        }
+        Ok(())
+    }
+    let mut loaded = Vec::new();
+    let dirs = (title_dir, cache_dir);
+    visit(main, dirs, wanted, &mut HashSet::new(), &mut loaded)?;
+    Ok(loaded)
+}
+
+/// Resolves through `inner`, then through the exports of the title's DLLs.
+pub struct WithTitleDlls<'a> {
+    pub inner: &'a dyn ImportResolver,
+    pub dlls: &'a [(String, LoadedImage)],
+}
+
+impl ImportResolver for WithTitleDlls<'_> {
+    fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
+        let found = self.inner.resolve(dll, symbol);
+        if found != Resolution::Missing {
+            return found;
+        }
+        self.dlls
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(dll))
+            .and_then(|(_, image)| image.export_symbol(symbol))
+            .map_or(Resolution::Missing, |address| Resolution::Found {
+                address,
+                provenance: Provenance::Title,
+            })
+    }
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -109,6 +178,16 @@ impl LoadedImage {
             .map(|f| f as *const () as usize)
     }
 
+    /// Address of an export, by name or ordinal.
+    pub fn export_symbol(&self, symbol: &ImportSymbol) -> Option<usize> {
+        match symbol {
+            ImportSymbol::Name { name, .. } => self.export(name),
+            // SAFETY: MAKEINTRESOURCE-style ordinal lookup on a valid module.
+            ImportSymbol::Ordinal(o) => unsafe { GetProcAddress(self.module, *o as usize as _) }
+                .map(|f| f as *const () as usize),
+        }
+    }
+
     /// Fills every IAT slot of the image.
     ///
     /// Each import goes to `resolver`; whatever it cannot resolve gets an
@@ -134,6 +213,7 @@ impl LoadedImage {
                         match provenance {
                             Provenance::Hle => report.hle += 1,
                             Provenance::Host => report.host += 1,
+                            Provenance::Title => report.title += 1,
                         }
                         slots.push((entry.iat_slot_rva, address));
                     }
@@ -209,13 +289,40 @@ impl LoadedImage {
         }
     }
 
-    /// Starts the title: on a new thread with the stack size from the image
-    /// header, runs the TLS callbacks (`DLL_PROCESS_ATTACH`), then the
-    /// original entry point. Returns the thread so the caller can join it.
+    /// Initialises a DLL as the Windows loader would: its TLS callbacks,
+    /// then `DllMain(DLL_PROCESS_ATTACH)`.
     ///
     /// # Safety
-    /// Runs title code. Imports must be bound first.
-    pub unsafe fn spawn_main(self: std::sync::Arc<Self>) -> Result<std::thread::JoinHandle<u32>> {
+    /// Runs title code. Imports must be bound first, and the DLLs this one
+    /// depends on attached.
+    pub unsafe fn attach(&self) -> Result<()> {
+        // SAFETY: forwarded from the caller.
+        unsafe { self.run_tls_callbacks(DLL_PROCESS_ATTACH) };
+        if self.info.entry_rva == 0 {
+            return Ok(());
+        }
+        type DllMain = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> i32;
+        // SAFETY: the entry RVA came from the original image header.
+        let main: DllMain =
+            unsafe { std::mem::transmute(self.base() + self.info.entry_rva as usize) };
+        // SAFETY: forwarded from the caller.
+        if unsafe { main(self.module, DLL_PROCESS_ATTACH, std::ptr::null_mut()) } == 0 {
+            bail!("DllMain returned FALSE");
+        }
+        Ok(())
+    }
+
+    /// Starts the title: on a new thread with the stack size from the image
+    /// header, attaches `dlls` in order (see [`Self::attach`]), runs the
+    /// image's TLS callbacks (`DLL_PROCESS_ATTACH`), then its original entry
+    /// point. Returns the thread so the caller can join it.
+    ///
+    /// # Safety
+    /// Runs title code. Imports of the image and of `dlls` must be bound.
+    pub unsafe fn spawn_main(
+        self: Arc<Self>,
+        dlls: Vec<(String, LoadedImage)>,
+    ) -> Result<std::thread::JoinHandle<Result<u32>>> {
         if self.info.entry_rva == 0 {
             bail!("image has no entry point");
         }
@@ -226,6 +333,10 @@ impl LoadedImage {
             .name("title-main".into())
             .stack_size(stack)
             .spawn(move || {
+                for (name, dll) in &dlls {
+                    // SAFETY: forwarded from the caller of `spawn_main`.
+                    unsafe { dll.attach() }.with_context(|| format!("attaching {name}"))?;
+                }
                 // SAFETY: forwarded from the caller of `spawn_main`.
                 unsafe { self.run_tls_callbacks(DLL_PROCESS_ATTACH) };
                 type Entry = unsafe extern "system" fn(*mut c_void) -> u32;
@@ -233,7 +344,7 @@ impl LoadedImage {
                 let entry: Entry =
                     unsafe { std::mem::transmute(self.base() + self.info.entry_rva as usize) };
                 // SAFETY: forwarded from the caller of `spawn_main`.
-                unsafe { entry(std::ptr::null_mut()) }
+                Ok(unsafe { entry(std::ptr::null_mut()) })
             })
             .context("spawning title main thread")
     }

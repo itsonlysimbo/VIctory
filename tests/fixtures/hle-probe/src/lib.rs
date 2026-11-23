@@ -12,6 +12,12 @@ unsafe extern "system" {
     fn VIctoryProbeNotImplemented(x: u64) -> u64;
 }
 
+// A DLL the "title" ships; the test supplies a renamed copy of version.dll.
+#[link(name = "victory-probe-title", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn GetFileVersionInfoSizeW(path: *const u16, handle: *mut u32) -> u32;
+}
+
 // Delay-loaded (see build.rs): bound through the delay-load table.
 #[link(name = "victory-probe-delayed", kind = "raw-dylib")]
 unsafe extern "system" {
@@ -40,6 +46,17 @@ pub extern "system" fn probe_tick() -> u32 {
 #[unsafe(no_mangle)]
 pub extern "system" fn probe_pid() -> u32 {
     unsafe { GetCurrentProcessId() }
+}
+
+/// An export of a title-shipped DLL: the version-info size of kernel32.dll.
+#[unsafe(no_mangle)]
+pub extern "system" fn probe_title() -> u32 {
+    let path: Vec<u16> = r"C:\Windows\System32\kernel32.dll"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let mut handle = 0;
+    unsafe { GetFileVersionInfoSizeW(path.as_ptr(), &mut handle) }
 }
 
 /// A delay-loaded console API.

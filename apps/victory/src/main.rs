@@ -7,6 +7,7 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+mod translate;
 
 use std::path::PathBuf;
 
@@ -66,6 +67,9 @@ enum Command {
         #[arg(long)]
         disasm: bool,
     },
+    /// Run every shader found (containers, SGD5 files) through the
+    /// translator and report what it cannot handle yet.
+    Translate { paths: Vec<PathBuf> },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -109,6 +113,7 @@ fn main() -> Result<()> {
             verbose,
             disasm,
         } => shader::run(paths, verbose || disasm, disasm),
+        Command::Translate { paths } => translate::run(paths),
         Command::Run {
             exe,
             unimplemented,

@@ -11,25 +11,34 @@
 //!    none of its code and resolves none of its imports;
 //! 2. load that copy as a real module (debuggers, profilers, crash dumps
 //!    and stack walks all see it); this step is Windows-only;
-//! 3. bind every import ourselves through an [`ImportResolver`], our
-//!    runtime (`victory-hle`) or the host, and route anything unresolved
-//!    to a generated stub that reports exactly what was called;
-//! 4. run TLS callbacks and the entry point on a thread with the stack size
-//!    the image asks for.
+//! 3. map the DLLs the title ships beside it the same way
+//!    (`load_title_dlls`);
+//! 4. bind every import ourselves through an [`ImportResolver`], our
+//!    runtime (`victory-hle`), the host or the title's DLLs, and route
+//!    anything unresolved to a generated stub that reports exactly what
+//!    was called;
+//! 5. initialise the title's DLLs, then run TLS callbacks and the entry
+//!    point on a thread with the stack size the image asks for.
 
+#[cfg(windows)]
+mod crash;
 pub mod prepare;
 pub mod resolve;
 #[cfg(windows)]
 mod thunks;
 #[cfg(windows)]
+mod tls;
+#[cfg(windows)]
 mod windows;
 
+#[cfg(windows)]
+pub use crash::{locate, report_crashes};
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(windows)]
 pub use thunks::{UnimplementedPolicy, unimplemented_call_count};
 #[cfg(windows)]
-pub use windows::{BindReport, LoadedImage, MissingImport, load};
+pub use windows::{BindReport, LoadedImage, MissingImport, WithTitleDlls, load, load_title_dlls};
 
 /// `DLL_PROCESS_ATTACH`, for TLS callbacks.
 pub const DLL_PROCESS_ATTACH: u32 = 1;

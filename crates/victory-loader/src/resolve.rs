@@ -10,6 +10,8 @@ pub enum Provenance {
     /// The host's own implementation (e.g. Windows API sets that behave the
     /// same on console and PC).
     Host,
+    /// A DLL the title ships, mapped like the executable.
+    Title,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

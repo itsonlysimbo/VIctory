@@ -18,7 +18,7 @@ mod fields;
 mod opcodes;
 mod sp3;
 
-pub use fields::{Cache, Dpp, Fields, Operand, Sdwa, Valu};
+pub use fields::{Cache, Dpp, Fields, NULL, Operand, Sdwa, Valu};
 
 use std::collections::BTreeMap;
 
@@ -76,12 +76,9 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
         while !found.contains_key(&offset) {
             let inst = instruction(code, offset)?;
             let next = offset + 4 * inst.words.len();
-            let flow = match flow(&inst, next, code.len())? {
-                Flow::Stop if inst.name() == Some("s_setpc_b64") => {
-                    far_jump(&found, &inst, code.len())?.map_or(Flow::Stop, Flow::Jump)
-                }
-                flow => flow,
-            };
+            let flow = control(&inst, code.len(), |at| {
+                found.range(..at).next_back().map(|(_, i)| i)
+            })?;
             found.insert(offset, inst);
             match flow {
                 Flow::Next => offset = next,
@@ -104,11 +101,30 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     Ok(list)
 }
 
-enum Flow {
+/// Where execution goes after an instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Flow {
     Next,
+    /// End of the program, or an indirect jump that is not a far jump.
     Stop,
     Jump(usize),
+    /// Conditional: to the target or the next instruction.
     Branch(usize),
+}
+
+/// Control flow after `inst`, resolving far jumps. `before(at)` returns the
+/// decoded instruction with the highest offset below `at`, if any.
+pub(crate) fn control<'a>(
+    inst: &Instruction,
+    len: usize,
+    before: impl Fn(usize) -> Option<&'a Instruction>,
+) -> Result<Flow, ShaderError> {
+    Ok(match flow(inst, inst.offset + 4 * inst.words.len(), len)? {
+        Flow::Stop if inst.name() == Some("s_setpc_b64") => {
+            far_jump(before, inst, len)?.map_or(Flow::Stop, Flow::Jump)
+        }
+        flow => flow,
+    })
 }
 
 fn flow(inst: &Instruction, next: usize, len: usize) -> Result<Flow, ShaderError> {
@@ -138,8 +154,8 @@ fn flow(inst: &Instruction, next: usize, len: usize) -> Result<Flow, ShaderError
 /// into s(n+1), `s_setpc_b64 s[n:n+1]`, looking back over the straight-line
 /// run just decoded. Any other `s_setpc_b64` (e.g. a handover to the next
 /// merged stage through registers) gives `None`.
-fn far_jump(
-    found: &BTreeMap<usize, Instruction>,
+fn far_jump<'a>(
+    before: impl Fn(usize) -> Option<&'a Instruction>,
     setpc: &Instruction,
     len: usize,
 ) -> Result<Option<usize>, ShaderError> {
@@ -147,7 +163,7 @@ fn far_jump(
     let mut delta = None;
     let mut at = setpc.offset;
     for _ in 0..4 {
-        let Some((_, prev)) = found.range(..at).next_back() else {
+        let Some(prev) = before(at) else {
             break;
         };
         if prev.offset + 4 * prev.words.len() != at {

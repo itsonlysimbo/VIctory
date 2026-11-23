@@ -44,9 +44,8 @@ impl HleResolver {
 
 impl ImportResolver for HleResolver {
     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
-        if let ImportSymbol::Name { name, .. } = symbol
-            && let Some(address) = registry::lookup(dll, name)
-        {
+        // Ordinal imports look up `#n`.
+        if let Some(address) = registry::lookup(dll, &symbol.to_string()) {
             return Resolution::Found {
                 address,
                 provenance: Provenance::Hle,

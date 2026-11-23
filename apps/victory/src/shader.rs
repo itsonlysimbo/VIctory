@@ -1,14 +1,53 @@
 //! Survey shader containers: bitcode, console additions and native code.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
+use victory_game::sgd5;
 use victory_shader::gfx10::{self, Instruction};
 use victory_shader::{Container, DxilProgram, FourCC, HwStage, ShaderError, native_programs};
 
 /// Files above this size are skipped (read whole into memory for now).
-const MAX_FILE: u64 = 2 << 30;
+pub(crate) const MAX_FILE: u64 = 2 << 30;
+
+/// A shader container in a file: as is, or packed in an SGD5 record.
+pub(crate) enum Source<'a> {
+    Raw { offset: usize, data: &'a [u8] },
+    Packed(sgd5::Record<'a>),
+}
+
+impl Source<'_> {
+    /// The container bytes; `None` if a packed record is corrupt.
+    pub(crate) fn bytes(&self) -> Option<Cow<'_, [u8]>> {
+        match self {
+            Source::Raw { data, .. } => Some(Cow::Borrowed(data)),
+            Source::Packed(r) => r.unpack().map(Cow::Owned),
+        }
+    }
+
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Source::Raw { offset, .. } => format!("@{offset:#x}"),
+            Source::Packed(r) => format!("@{:#x} {}", r.offset, r.name.unwrap_or("?")),
+        }
+    }
+}
+
+/// The records of an SGD5 file, or else every container found by its magic.
+pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
+    if sgd5::is_sgd5(data) {
+        return sgd5::records(data).map(Source::Packed).collect();
+    }
+    memchr::memmem::find_iter(data, b"DXBC")
+        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
+        .map(|offset| Source::Raw {
+            offset,
+            data: &data[offset..],
+        })
+        .collect()
+}
 
 #[derive(Default)]
 struct Totals {
@@ -49,8 +88,12 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                 continue;
             };
             let mut found_here = 0;
-            for offset in memchr::memmem::find_iter(&data, b"DXBC") {
-                let Ok(container) = Container::parse(&data[offset..]) else {
+            for source in sources(&data) {
+                let Some(bytes) = source.bytes() else {
+                    eprintln!("corrupt record {}{}", path.display(), source.label());
+                    continue;
+                };
+                let Ok(container) = Container::parse(&bytes) else {
                     continue;
                 };
                 found_here += 1;
@@ -120,7 +163,7 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     None => "no parsable DXIL program".to_owned(),
                 } + &native;
                 if verbose {
-                    println!("{}@{offset:#x}: {line}", path.display());
+                    println!("{}{}: {line}", path.display(), source.label());
                     for l in &listing {
                         println!("{l}");
                     }

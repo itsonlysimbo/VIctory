@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use victory_loader::{
-    ImportResolver, Provenance, Resolution, UnimplementedPolicy, prepare, unimplemented_call_count,
+    ImportResolver, Provenance, Resolution, UnimplementedPolicy, WithTitleDlls, prepare,
+    unimplemented_call_count,
 };
 use victory_pe::ImportSymbol;
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
@@ -120,9 +121,33 @@ fn loads_binds_and_calls_probe() {
 
     let dir = tempfile::tempdir().unwrap();
     let image = victory_loader::load(&prepared, dir.path()).unwrap();
+
+    // The "title" ships victory-probe-title.dll: any real DLL will do.
+    let title_dir = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        r"C:\Windows\System32\version.dll",
+        title_dir.path().join("victory-probe-title.dll"),
+    )
+    .unwrap();
+    let dlls =
+        victory_loader::load_title_dlls(image.info(), title_dir.path(), dir.path(), &|_| true)
+            .unwrap();
+    let names: Vec<_> = dlls.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["victory-probe-title.dll"]);
+    let resolver = WithTitleDlls {
+        inner: &TestResolver,
+        dlls: &dlls,
+    };
+    for (_, dll) in &dlls {
+        dll.bind_imports(&resolver, UnimplementedPolicy::ReturnZero)
+            .unwrap();
+        // SAFETY: its imports are bound, and it depends on no other title DLL.
+        unsafe { dll.attach() }.unwrap();
+    }
     let report = image
-        .bind_imports(&TestResolver, UnimplementedPolicy::ReturnZero)
+        .bind_imports(&resolver, UnimplementedPolicy::ReturnZero)
         .unwrap();
+    assert_eq!(report.title, 1);
 
     assert_eq!(report.hle, 3);
     assert!(report.host > 0);
@@ -141,6 +166,9 @@ fn loads_binds_and_calls_probe() {
 
         let f: extern "system" fn() -> u32 = std::mem::transmute(call("probe_pid"));
         assert_eq!(f(), std::process::id(), "host API must pass through");
+
+        let f: extern "system" fn() -> u32 = std::mem::transmute(call("probe_title"));
+        assert_ne!(f(), 0, "title DLL export must be bound");
 
         let f: extern "system" fn() -> u32 = std::mem::transmute(call("probe_delayed"));
         assert_eq!(f(), 4242, "delay-loaded API must be bound");

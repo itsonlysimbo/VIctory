@@ -17,6 +17,7 @@
 //!               mesh 0x48, compute 0x60; unused ones are 0xDEADBEEF_DEADBEEF
 //! record  +0x00 u64 code offset, +0x08 u64 code size (payload-relative),
 //!         +0x14 u32 flags: bit 5 wave32 (else wave64)
+//!         +0x50 u32 bits 0-9 VGPRs used, bits 20-27 SGPRs used
 //! ```
 //!
 //! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
@@ -47,9 +48,10 @@ const SLOTS: [(HwStage, usize); 8] = [
     (HwStage::Cs, 0x60),
 ];
 const ABSENT: u64 = 0xDEAD_BEEF_DEAD_BEEF;
-const RECORD_SIZE: u64 = 0x18;
+const RECORD_SIZE: u64 = 0x54;
 const RECORD_FLAGS: usize = 0x14;
 const FLAG_WAVE32: u32 = 1 << 5;
+const RECORD_REGS: usize = 0x50;
 /// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: u64 = 16 << 20;
 
@@ -72,6 +74,8 @@ pub struct NativeProgram {
     pub stage: HwStage,
     /// Runs as 64 lanes per wave (else 32); sizes lane masks.
     pub wave64: bool,
+    /// VGPRs the program uses (v0 up to this), the bound of indexed access.
+    pub vgprs: u16,
     /// GFX10 machine code.
     pub code: Vec<u8>,
 }
@@ -145,9 +149,14 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
             bytes(payload, record, RECORD_SIZE).ok_or(Malformed("FSSM record out of bounds"))?;
         let code = bytes(payload, u64_at(record, 0)?, u64_at(record, 8)?)
             .ok_or(Malformed("native code out of bounds"))?;
+        let vgprs = (u32_at(record, RECORD_REGS)? & 0x3FF) as u16;
+        if vgprs > 256 {
+            return Err(Malformed("implausible VGPR count"));
+        }
         out.push(NativeProgram {
             stage,
             wave64: u32_at(record, RECORD_FLAGS)? & FLAG_WAVE32 == 0,
+            vgprs,
             code: code.to_vec(),
         });
     }
@@ -166,6 +175,7 @@ mod tests {
 
     const VS_CODE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
     const PS_CODE: [u8; 4] = [9, 10, 11, 12];
+    const VGPRS: u32 = 28;
 
     fn slot(stage: HwStage) -> usize {
         SLOTS.iter().find(|s| s.0 == stage).unwrap().1
@@ -187,6 +197,8 @@ mod tests {
             let flags = if stage == HwStage::Ps { FLAG_WAVE32 } else { 0 };
             payload.extend_from_slice(&[0; 4]);
             payload.extend_from_slice(&flags.to_le_bytes());
+            payload.resize(record as usize + RECORD_REGS, 0);
+            payload.extend_from_slice(&(VGPRS | 31 << 20).to_le_bytes());
             payload.extend_from_slice(code);
         }
         let mut out = b"FSSM".to_vec();
@@ -236,11 +248,13 @@ mod tests {
                 NativeProgram {
                     stage: HwStage::Vs,
                     wave64: true,
+                    vgprs: 28,
                     code: VS_CODE.to_vec()
                 },
                 NativeProgram {
                     stage: HwStage::Ps,
                     wave64: false,
+                    vgprs: 28,
                     code: PS_CODE.to_vec()
                 },
             ]

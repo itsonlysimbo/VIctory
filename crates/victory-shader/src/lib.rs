@@ -9,7 +9,9 @@
 pub mod dxbc;
 pub mod dxil;
 pub mod gfx10;
+pub mod ir;
 pub mod native;
+pub mod structure;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
@@ -23,4 +25,7 @@ pub enum ShaderError {
     Malformed(&'static str),
     #[error("GFX10 code at {offset:#x}: {reason}")]
     Isa { offset: usize, reason: &'static str },
+    /// Valid code the translator cannot handle yet: an opcode name or a construct.
+    #[error("GFX10 code at {offset:#x}: {what} is not supported")]
+    Unsupported { offset: usize, what: &'static str },
 }

@@ -17,6 +17,9 @@ pub struct Config {
     pub game_dir: Option<PathBuf>,
     /// Root for all derived data. Always outside the repository.
     pub cache_dir: PathBuf,
+    /// What titles write and must keep (persistent local storage). Never
+    /// inside the cache, which may be deleted at any time.
+    pub data_dir: PathBuf,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
     /// The config file that was read, if any.
@@ -35,6 +38,7 @@ struct FileConfig {
 struct FilePaths {
     game_dir: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
     #[serde(default)]
     test_titles: Vec<PathBuf>,
 }
@@ -83,10 +87,14 @@ impl Config {
         };
         let cache_dir = env_path("VICTORY_CACHE_DIR")
             .or(file.cache_dir)
-            .map_or_else(default_cache_dir, Ok)?;
+            .map_or_else(|| default_dir("cache"), Ok)?;
+        let data_dir = env_path("VICTORY_DATA_DIR")
+            .or(file.data_dir)
+            .map_or_else(|| default_dir("data"), Ok)?;
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
+            data_dir,
             test_titles,
             source,
         })
@@ -102,20 +110,30 @@ impl Config {
 
     /// Returns `<cache>/<sub>`, creating it, after checking the asset policy.
     pub fn cache_subdir(&self, sub: &str) -> Result<PathBuf> {
-        let dir = self.cache_dir.join(sub);
-        ensure_outside_repo(&dir)?;
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        Ok(dir)
+        subdir(&self.cache_dir, sub)
+    }
+
+    /// Returns `<data>/<sub>`, creating it, after checking the asset policy.
+    pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
+        subdir(&self.data_dir, sub)
     }
 }
 
-fn default_cache_dir() -> Result<PathBuf> {
+fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
+    let dir = root.join(sub);
+    ensure_outside_repo(&dir)?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// `%LOCALAPPDATA%/victory/<name>` (elsewhere the XDG or home cache).
+fn default_dir(name: &str) -> Result<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .context("cannot determine a cache directory; set VICTORY_CACHE_DIR")?;
-    Ok(base.join("victory").join("cache"))
+        .context("cannot determine a user directory; set VICTORY_CACHE_DIR and VICTORY_DATA_DIR")?;
+    Ok(base.join("victory").join(name))
 }
 
 #[cfg(test)]

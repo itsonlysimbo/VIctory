@@ -3,6 +3,8 @@
 //! offsets or byte-pattern signatures). What may and may not be stored here
 //! is defined in docs/asset-policy.md.
 
+pub mod sgd5;
+
 /// A specific build of the title executable we know how to run.
 #[derive(Debug, Clone, Copy)]
 pub struct KnownBuild {

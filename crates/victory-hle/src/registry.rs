@@ -4,7 +4,8 @@ use std::sync::LazyLock;
 
 use crate::modules;
 
-/// One function we implement, under the name the title imports.
+/// One function we implement, under the name the title imports (`#n` for an
+/// ordinal).
 #[derive(Debug, Clone, Copy)]
 pub struct HleExport {
     pub name: &'static str,

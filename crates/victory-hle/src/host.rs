@@ -36,6 +36,14 @@ impl Default for HostPolicy {
             "sspicli.dll",
             "cabinet.dll",
             "avrt.dll",
+            // Window, message and shell APIs: the host's desktop window
+            // stands in for the console's single core window.
+            "ext-ms-win-rtcore-ntuser-*",
+            "api-ms-win-shcore-*",
+            "msvcp_win.dll",
+            "ole32.dll",
+            "advapi32.dll",
+            "iphlpapi.dll",
         ];
         HostPolicy {
             allow: allow.iter().map(|s| s.to_string()).collect(),
@@ -65,6 +73,16 @@ impl HostPolicy {
         }
         imp::resolve(dll, symbol)
     }
+}
+
+/// The host's own `name` from the System32 DLL `dll`: what a title import
+/// of it is bound to when we do not override it.
+pub(crate) fn function(dll: &str, name: &str) -> Option<usize> {
+    let name = ImportSymbol::Name {
+        hint: 0,
+        name: name.into(),
+    };
+    imp::resolve(dll, &name)
 }
 
 #[cfg(windows)]

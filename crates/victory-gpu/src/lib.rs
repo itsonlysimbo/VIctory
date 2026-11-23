@@ -1,12 +1,31 @@
 //! D3D12.X on host D3D12.
 //!
-//! D3D12.X records many commands by writing command-processor packets into
-//! command lists from code inlined into the title itself, so no import-level
-//! hook sees them. This crate decodes those packet streams at
-//! `ExecuteCommandLists` time and replays them on host D3D12, and maps the
-//! title's GPU virtual addresses (console memory is unified) to host
-//! resources.
+//! D3D12.X records commands from code inlined into the title, which writes
+//! packets into the command list while its put pointer is below a limit and
+//! calls the list's method otherwise. Our lists keep the limits at zero, so
+//! every command arrives here as a call, to be run on host D3D12. The
+//! title's GPU addresses are CPU addresses (console memory is unified).
 //!
-//! Planned modules: `packets` (stream decoder), `memory` (title GPU
-//! addresses to host heaps), `pipeline` (PSOs from `victory-shader` output),
-//! `present` (swap chain, frame pacing).
+//! [`device`] is the device object titles create, [`dxgi`] its adapter side,
+//! [`resource`] heaps and resources, [`fence`] fences, [`queue`] command
+//! queues, [`list`] command allocators and lists, [`descriptor`]
+//! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
+//! [`signature`] command signatures, [`pipeline`] pipeline states,
+//! [`frame`] frame pacing, [`object`] what all console graphics objects
+//! share. Planned: `present` (swap chain).
+
+pub mod descriptor;
+pub mod device;
+pub mod dxgi;
+pub mod fence;
+pub mod frame;
+#[cfg(windows)]
+mod host;
+pub mod list;
+pub mod object;
+pub mod pipeline;
+pub mod query;
+pub mod queue;
+pub mod resource;
+pub mod root;
+pub mod signature;
