@@ -38,7 +38,9 @@ pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(windows)]
 pub use thunks::{UnimplementedPolicy, unimplemented_call_count};
 #[cfg(windows)]
-pub use windows::{BindReport, LoadedImage, MissingImport, WithTitleDlls, load, load_title_dlls};
+pub use windows::{
+    BindReport, LoadedImage, MissingImport, WithTitleDlls, load, load_title_dll, load_title_dlls,
+};
 
 /// `DLL_PROCESS_ATTACH`, for TLS callbacks.
 pub const DLL_PROCESS_ATTACH: u32 = 1;

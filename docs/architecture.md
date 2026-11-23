@@ -58,6 +58,8 @@ For every `dll!function` the title imports, in order:
 
 `LoadLibrary*` of a console-only DLL we implement (e.g. `xgameruntime.dll`)
 returns a pseudo handle; `GetProcAddress` on it finds our functions.
+`LoadLibrary*` of a title DLL returns its mapped image, mapping it first if
+nothing imports it.
 `QueryApiImpl` hands out our runtime objects by provider (task queues and
 async blocks so far, `victory-hle::modules::xasync`).
 

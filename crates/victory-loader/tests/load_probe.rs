@@ -181,3 +181,24 @@ fn loads_binds_and_calls_probe() {
         image.unload();
     }
 }
+
+#[test]
+fn maps_a_title_dll_the_title_loads_itself() {
+    let title_dir = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    // Any real DLL will do; it imports only host DLLs, which are not in the folder.
+    std::fs::copy(
+        r"C:\Windows\System32\version.dll",
+        title_dir.path().join("Late.dll"),
+    )
+    .unwrap();
+    let load = |name: &str, wanted: &dyn Fn(&str) -> bool| {
+        victory_loader::load_title_dll(name, title_dir.path(), cache.path(), wanted).unwrap()
+    };
+    let dlls = load("LATE.DLL", &|_| true);
+    let names: Vec<_> = dlls.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["late.dll"]);
+    assert!(dlls[0].1.export("GetFileVersionInfoW").is_some());
+    assert!(load("absent.dll", &|_| true).is_empty());
+    assert!(load("late.dll", &|_| false).is_empty());
+}

@@ -33,10 +33,7 @@ pub fn run(exe: &Path, unimplemented: Unimplemented, strict: bool, execute: bool
     } else {
         HostPolicy::default()
     });
-    // DLLs the host or our runtime provide are never taken from the title.
-    let wanted = |dll: &str| {
-        !resolver.host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
-    };
+    let wanted = |dll: &str| title_dll(&resolver.host, dll);
     let title_dir = exe.parent().unwrap_or(Path::new("."));
     // A missing manifest leaves id 0 and no storage quota.
     let manifest =
@@ -86,6 +83,16 @@ pub fn run(exe: &Path, unimplemented: Unimplemented, strict: bool, execute: bool
         return Ok(());
     }
     victory_loader::report_crashes();
+    let late = LateDlls {
+        host: resolver.host.clone(),
+        title_dir: title_dir.to_owned(),
+        cache_dir: images,
+        policy,
+        mapped: std::sync::Mutex::new(dlls.clone()),
+    };
+    victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
+        late.load(file, show).map_err(|e| format!("{e:#}"))
+    }));
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main
@@ -93,6 +100,66 @@ pub fn run(exe: &Path, unimplemented: Unimplemented, strict: bool, execute: bool
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(())
+}
+
+/// DLLs the host or our runtime provide are never taken from the title.
+#[cfg(windows)]
+fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
+    !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
+}
+
+/// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,
+/// e.g. the title's upscaler behind its FidelityFX loader.
+#[cfg(windows)]
+struct LateDlls {
+    host: victory_hle::HostPolicy,
+    title_dir: std::path::PathBuf,
+    cache_dir: std::path::PathBuf,
+    policy: victory_loader::UnimplementedPolicy,
+    /// Every title DLL mapped so far, to bind new ones against.
+    mapped: std::sync::Mutex<Vec<(String, victory_loader::LoadedImage)>>,
+}
+
+#[cfg(windows)]
+impl LateDlls {
+    /// Maps `file` and the title DLLs it needs, binds them and runs their
+    /// `DllMain` on the calling thread, as the Windows loader would.
+    fn load(
+        &self,
+        file: &str,
+        show: impl Fn(&str, victory_loader::BindReport),
+    ) -> Result<Option<usize>> {
+        use victory_hle::runtime::{image_named, set_image_path};
+        // shortcut: not reentrant, so a DllMain that loads another new title
+        // DLL deadlocks; use a reentrant lock if a title does that.
+        let mut mapped = self.mapped.lock().unwrap_or_else(|e| e.into_inner());
+        let wanted = |dll: &str| title_dll(&self.host, dll) && image_named(dll).is_none();
+        let new = victory_loader::load_title_dll(file, &self.title_dir, &self.cache_dir, &wanted)?;
+        let hle = victory_hle::HleResolver::new(self.host.clone());
+        let old = victory_loader::WithTitleDlls {
+            inner: &hle,
+            dlls: &mapped,
+        };
+        let resolver = victory_loader::WithTitleDlls {
+            inner: &old,
+            dlls: &new,
+        };
+        for (name, dll) in &new {
+            println!(
+                "title dll      {name} at {:#x} (loaded by the title)",
+                dll.base()
+            );
+            show(name, dll.bind_imports(&resolver, self.policy)?);
+            set_image_path(dll.base(), &self.title_dir.join(name));
+        }
+        for (name, dll) in &new {
+            // SAFETY: bound above, dependencies attached first.
+            unsafe { dll.attach() }.with_context(|| format!("attaching {name}"))?;
+        }
+        let base = new.last().map(|(_, dll)| dll.base());
+        mapped.extend(new);
+        Ok(base)
+    }
 }
 
 #[cfg(not(windows))]

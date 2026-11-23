@@ -40,6 +40,31 @@ pub fn image_path(base: usize) -> Option<PathBuf> {
         .map(|(_, p)| p.clone())
 }
 
+/// The title image whose original file is called `file` (any case).
+pub fn image_named(file: &str) -> Option<usize> {
+    let paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
+    paths
+        .iter()
+        .find(|(_, p)| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(file)))
+        .map(|(b, _)| *b)
+}
+
+/// Maps a title DLL the title loads itself (`LoadLibrary`) and returns its
+/// base; `Ok(None)` if `file` is not one of the title's DLLs.
+pub type TitleDllLoader = Box<dyn Fn(&str) -> Result<Option<usize>, String> + Send + Sync>;
+
+static TITLE_DLL_LOADER: std::sync::OnceLock<TitleDllLoader> = std::sync::OnceLock::new();
+
+/// Set once, by whoever mapped the title (it knows the folders and the
+/// resolver); later calls are ignored.
+pub fn set_title_dll_loader(loader: TitleDllLoader) {
+    let _ = TITLE_DLL_LOADER.set(loader);
+}
+
+pub fn load_title_dll(file: &str) -> Result<Option<usize>, String> {
+    TITLE_DLL_LOADER.get().map_or(Ok(None), |load| load(file))
+}
+
 /// What the title's manifest (`MicrosoftGame.config` beside its executable)
 /// says about it, and where its persistent local storage lives.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

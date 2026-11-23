@@ -16,8 +16,9 @@ use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
 use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
 use crate::{DLL_PROCESS_ATTACH, ImportResolver, PreparedImage, Provenance, Resolution, prepare};
 
-/// A title image mapped into this process.
-#[derive(Debug)]
+/// A title image mapped into this process. A clone names the same mapping
+/// (no reference of its own): unload one copy only.
+#[derive(Debug, Clone)]
 pub struct LoadedImage {
     module: HMODULE,
     path: PathBuf,
@@ -99,32 +100,59 @@ pub fn load_title_dlls(
     cache_dir: &Path,
     wanted: &dyn Fn(&str) -> bool,
 ) -> Result<Vec<(String, LoadedImage)>> {
-    fn visit(
-        info: &ImageInfo,
-        dirs: (&Path, &Path),
-        wanted: &dyn Fn(&str) -> bool,
-        seen: &mut HashSet<String>,
-        loaded: &mut Vec<(String, LoadedImage)>,
-    ) -> Result<()> {
-        for module in info.imports.iter().chain(&info.delay_imports) {
-            let name = module.dll.to_ascii_lowercase();
-            let path = dirs.0.join(&name);
-            if !seen.insert(name.clone()) || !wanted(&name) || !path.is_file() {
-                continue;
-            }
-            let original =
-                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-            let image = load(&prepare(&original)?, dirs.1)
-                .with_context(|| format!("loading {}", path.display()))?;
-            visit(&image.info, dirs, wanted, seen, loaded)?;
-            loaded.push((name, image));
-        }
-        Ok(())
-    }
     let mut loaded = Vec::new();
     let dirs = (title_dir, cache_dir);
-    visit(main, dirs, wanted, &mut HashSet::new(), &mut loaded)?;
+    map_imports(main, dirs, wanted, &mut HashSet::new(), &mut loaded)?;
     Ok(loaded)
+}
+
+/// Maps the DLL `name` from `title_dir` like [`load_title_dlls`] does, with
+/// the title DLLs it imports (dependencies first, `name` last); empty if
+/// `wanted` refuses it or the folder has no such file. For DLLs a title
+/// loads itself; `wanted` must refuse those already mapped.
+pub fn load_title_dll(
+    name: &str,
+    title_dir: &Path,
+    cache_dir: &Path,
+    wanted: &dyn Fn(&str) -> bool,
+) -> Result<Vec<(String, LoadedImage)>> {
+    let mut loaded = Vec::new();
+    let dirs = (title_dir, cache_dir);
+    map_dll(name, dirs, wanted, &mut HashSet::new(), &mut loaded)?;
+    Ok(loaded)
+}
+
+fn map_imports(
+    info: &ImageInfo,
+    dirs: (&Path, &Path),
+    wanted: &dyn Fn(&str) -> bool,
+    seen: &mut HashSet<String>,
+    loaded: &mut Vec<(String, LoadedImage)>,
+) -> Result<()> {
+    for module in info.imports.iter().chain(&info.delay_imports) {
+        map_dll(&module.dll, dirs, wanted, seen, loaded)?;
+    }
+    Ok(())
+}
+
+fn map_dll(
+    name: &str,
+    dirs: (&Path, &Path),
+    wanted: &dyn Fn(&str) -> bool,
+    seen: &mut HashSet<String>,
+    loaded: &mut Vec<(String, LoadedImage)>,
+) -> Result<()> {
+    let name = name.to_ascii_lowercase();
+    let path = dirs.0.join(&name);
+    if !seen.insert(name.clone()) || !wanted(&name) || !path.is_file() {
+        return Ok(());
+    }
+    let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let image = load(&prepare(&original)?, dirs.1)
+        .with_context(|| format!("loading {}", path.display()))?;
+    map_imports(&image.info, dirs, wanted, seen, loaded)?;
+    loaded.push((name, image));
+    Ok(())
 }
 
 /// Resolves through `inner`, then through the exports of the title's DLLs.
