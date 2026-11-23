@@ -146,8 +146,14 @@ pub extern "system" fn LoadLibraryW(name: *const u16) -> *mut c_void {
 /// Looks up our implementations behind a pseudo handle; real modules go to
 /// the host.
 pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void {
+    // `NULL` is the process's exe, which for the title is its own image.
+    let module = if module.is_null() {
+        runtime::main_image().unwrap_or(0) as *mut c_void
+    } else {
+        module
+    };
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
-        return host::get_proc_address(module, name);
+        return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
     // Values below 0x10000 are ordinals; we export by name only.
     if (name as usize) < 0x1_0000 {
@@ -167,6 +173,25 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
             std::ptr::null_mut()
         }
     }
+}
+
+/// What a host module's `name` (or ordinal) is bound to at import binding
+/// when we override it: a title that looks a function up by name must not
+/// get past our overrides (the network guard, path rewriting).
+fn host_override(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
+    if module.is_null() || runtime::image_path(module as usize).is_some() {
+        return None;
+    }
+    let symbol = if (name as usize) < 0x1_0000 {
+        format!("#{}", name as usize)
+    } else {
+        narrow(name)
+    };
+    let mut path = [0u16; 260];
+    let len = host::get_module_file_name_w(module, path.as_mut_ptr(), path.len() as u32) as usize;
+    let path = String::from_utf16_lossy(&path[..len.min(path.len())]);
+    let file = path.rsplit('\\').next()?;
+    crate::registry::lookup(file, &symbol).map(|address| address as *mut c_void)
 }
 
 /// Our pseudo modules and the title's images stay loaded: `LoadLibrary`
@@ -189,14 +214,18 @@ pub extern "system" fn DisableThreadLibraryCalls(module: *mut c_void) -> i32 {
 /// Title debug output goes to our log (no debugger needs to be attached).
 pub extern "system" fn OutputDebugStringA(text: *const u8) {
     if !text.is_null() {
-        tracing::info!(target: "title", "{}", narrow(text).trim_end());
+        let text = narrow(text);
+        host::note_title_output(text.trim());
+        tracing::info!(target: "title", "{}", text.trim_end());
     }
 }
 
 /// See [`OutputDebugStringA`].
 pub extern "system" fn OutputDebugStringW(text: *const u16) {
     if !text.is_null() {
-        tracing::info!(target: "title", "{}", wide(text).trim_end());
+        let text = wide(text);
+        host::note_title_output(text.trim());
+        tracing::info!(target: "title", "{}", text.trim_end());
     }
 }
 
@@ -226,6 +255,28 @@ pub extern "C" fn _invalid_parameter_noinfo_noreturn() -> ! {
     host::abort()
 }
 
+/// The title's unhandled-exception filter. Ours stands in front of it and
+/// reports the crash first; the title still gets its own back.
+static TITLE_FILTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub extern "system" fn SetUnhandledExceptionFilter(filter: usize) -> usize {
+    host::set_unhandled_exception_filter(report_unhandled);
+    TITLE_FILTER.swap(filter, std::sync::atomic::Ordering::AcqRel)
+}
+
+extern "system" fn report_unhandled(info: *const c_void) -> i32 {
+    host::report_unhandled(info);
+    match TITLE_FILTER.load(std::sync::atomic::Ordering::Acquire) {
+        0 => 0, // EXCEPTION_CONTINUE_SEARCH
+        filter => {
+            type Filter = extern "system" fn(*const c_void) -> i32;
+            // SAFETY: the title registered this filter.
+            let filter: Filter = unsafe { std::mem::transmute(filter) };
+            filter(info)
+        }
+    }
+}
+
 /// See [`exit`]; only the current process is logged.
 pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 {
     if process as isize == -1 {
@@ -240,7 +291,9 @@ fn handle(m: &HleModule) -> *mut c_void {
 }
 
 /// The title's images and our console modules by name; `None` leaves the
-/// name to the host. With `load`, a title DLL not mapped yet is mapped now.
+/// name to the host, which only DLLs `HostPolicy` passes through get (as at
+/// import binding); others fail. With `load`, a title DLL not mapped yet is
+/// mapped now.
 fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
     // As the Windows loader does, a name without extension means a DLL.
@@ -249,29 +302,49 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     } else {
         format!("{file}.dll")
     };
+    // Loads go through the title DLL loader first: it waits for a DLL that
+    // another thread is still initialising, as the Windows loader lock does.
+    if load {
+        match runtime::load_title_dll(&file) {
+            Ok(Some(base)) => return Some(base as *mut c_void),
+            Ok(None) => {}
+            // Not the host: it would load the unpatched DLL from the title's folder.
+            Err(error) => {
+                tracing::error!(dll = file, %error, "mapping a title DLL failed");
+                host::set_last_error(ERROR_MOD_NOT_FOUND);
+                return Some(std::ptr::null_mut());
+            }
+        }
+    }
     if let Some(base) = runtime::image_named(&file) {
         return Some(base as *mut c_void);
     }
     // DLLs the host has too are real host modules, whatever `--strict` says.
-    if !HostPolicy::default().allows(&file)
-        && let Some(m) = registry().iter().find(|m| m.serves(&file))
-    {
+    let host_dll = HostPolicy::default().allows(&file);
+    if !host_dll && let Some(m) = registry().iter().find(|m| m.serves(&file)) {
         if load {
             tracing::info!(dll = file, "loaded as a pseudo module");
         }
         return Some(handle(m));
     }
-    if !load {
+    if host_dll {
         return None;
     }
-    match runtime::load_title_dll(&file) {
-        Ok(base) => base.map(|b| b as *mut c_void),
-        // Not the host: it would load the unpatched DLL from the title's folder.
-        Err(error) => {
-            tracing::error!(dll = file, %error, "mapping a title DLL failed");
-            host::set_last_error(ERROR_MOD_NOT_FOUND);
-            Some(std::ptr::null_mut())
-        }
+    // Any other host DLL (wininet, urlmon, ...) is beyond what we guard, and
+    // the console does not have it.
+    refuse(&file);
+    host::set_last_error(ERROR_MOD_NOT_FOUND);
+    Some(std::ptr::null_mut())
+}
+
+/// Logs a DLL name the title is refused, once.
+fn refuse(file: &str) {
+    static REFUSED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let file = file.to_ascii_lowercase();
+    let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    if !refused.contains(&file) {
+        tracing::warn!(dll = file, "a host DLL outside the host policy: refused");
+        refused.push(file);
     }
 }
 
@@ -286,6 +359,7 @@ pub(crate) fn module() -> HleModule {
             "api-ms-win-core-libraryloader-*",
             "api-ms-win-core-processthreads-*",
             "api-ms-win-core-debug-*",
+            "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
         ],
         exports: vec![
@@ -307,8 +381,15 @@ pub(crate) fn module() -> HleModule {
             hle_export!(terminate),
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
+            hle_export!(SetUnhandledExceptionFilter),
         ],
     }
+}
+
+/// The return addresses above the caller, as `module+rva`, for logs.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn callers() -> String {
+    host::callers()
 }
 
 #[cfg(windows)]
@@ -405,6 +486,27 @@ mod host {
         unsafe { TerminateProcess(process, code) }
     }
 
+    pub(super) fn set_unhandled_exception_filter(filter: extern "system" fn(*const c_void) -> i32) {
+        // SAFETY: our filter takes the exception pointers as an opaque pointer.
+        unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter(
+                std::mem::transmute::<
+                    extern "system" fn(*const c_void) -> i32,
+                    windows_sys::Win32::System::Diagnostics::Debug::LPTOP_LEVEL_EXCEPTION_FILTER,
+                >(filter),
+            )
+        };
+    }
+
+    pub(super) fn report_unhandled(info: *const c_void) {
+        // SAFETY: the system's exception pointers, passed to the filter.
+        unsafe { victory_loader::report_unhandled(info.cast()) };
+    }
+
+    pub(super) fn note_title_output(line: &str) {
+        victory_loader::note_title_output(line);
+    }
+
     /// Our caller's callers, as `module+rva`.
     pub(super) fn callers() -> String {
         let mut frames = [std::ptr::null_mut(); 12];
@@ -479,6 +581,12 @@ mod host {
         std::process::exit(code as i32)
     }
 
+    pub(super) fn set_unhandled_exception_filter(_: extern "system" fn(*const c_void) -> i32) {}
+
+    pub(super) fn report_unhandled(_: *const c_void) {}
+
+    pub(super) fn note_title_output(_: &str) {}
+
     pub(super) fn callers() -> String {
         String::new()
     }
@@ -509,6 +617,41 @@ mod tests {
 
     fn w(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(Some(0)).collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_lookups_by_name_get_our_overrides() {
+        let kernel32 = GetModuleHandleW(w("kernel32.dll").as_ptr());
+        assert!(!kernel32.is_null());
+        let ours = crate::registry::lookup("kernel32.dll", "CreateFileW").unwrap();
+        assert_eq!(
+            GetProcAddress(kernel32, c"CreateFileW".as_ptr().cast()) as usize,
+            ours
+        );
+        // A plain name stays the host's.
+        let host = host::get_proc_address(kernel32, c"GetTickCount".as_ptr().cast());
+        assert!(!host.is_null());
+        assert_eq!(
+            GetProcAddress(kernel32, c"GetTickCount".as_ptr().cast()),
+            host
+        );
+        // Host DLLs outside the host policy do not exist for the title.
+        assert!(LoadLibraryW(w("wininet.dll").as_ptr()).is_null());
+        assert!(LoadLibraryA(c"C:\\Windows\\System32\\urlmon".as_ptr().cast()).is_null());
+        assert!(GetModuleHandleW(w("WININET.DLL").as_ptr()).is_null());
+        assert_eq!(
+            // SAFETY: reads this thread's last error.
+            unsafe { windows_sys::Win32::Foundation::GetLastError() },
+            ERROR_MOD_NOT_FOUND
+        );
+        assert!(!LoadLibraryW(w("kernel32").as_ptr()).is_null());
+        // By ordinal too (ws2_32 #4 is `connect`).
+        let ws2 = LoadLibraryW(w("ws2_32.dll").as_ptr());
+        assert_eq!(
+            GetProcAddress(ws2, 4 as *const u8) as usize,
+            crate::registry::lookup("ws2_32.dll", "connect").unwrap()
+        );
     }
 
     #[test]

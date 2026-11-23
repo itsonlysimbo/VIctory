@@ -28,8 +28,72 @@ pub static IID: Iid = guid(
     [0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7],
 );
 
-/// The interface version these layouts were checked against (2.4, what
-/// Minecraft passes). Newer titles may lay objects out differently.
+/// The levels the device answers to, as on PC: `ID3D12Device1` to
+/// `ID3D12Device8`, and `ID3D12Device11`, which the title creates
+/// its device as. Each level's table is the one before plus its methods.
+const LEVEL_IIDS: [Iid; 9] = [
+    guid(
+        0x77acce80,
+        0x638e,
+        0x4e65,
+        [0x88, 0x95, 0xc1, 0xf2, 0x33, 0x86, 0x86, 0x3e],
+    ),
+    guid(
+        0x30baa41e,
+        0xb15b,
+        0x475c,
+        [0xa0, 0xbb, 0x1a, 0xf5, 0xc5, 0xb6, 0x43, 0x28],
+    ),
+    guid(
+        0x81dadc15,
+        0x2bad,
+        0x4392,
+        [0x93, 0xc5, 0x10, 0x13, 0x45, 0xc4, 0xaa, 0x98],
+    ),
+    guid(
+        0xe865df17,
+        0xa9ee,
+        0x46f9,
+        [0xa4, 0x63, 0x30, 0x98, 0x31, 0x5a, 0xa2, 0xe5],
+    ),
+    guid(
+        0x8b4f173b,
+        0x2fea,
+        0x4b80,
+        [0x8f, 0x58, 0x43, 0x07, 0x19, 0x1a, 0xb9, 0x5d],
+    ),
+    guid(
+        0xc70b221b,
+        0x40e4,
+        0x4a17,
+        [0x89, 0xaf, 0x02, 0x5a, 0x07, 0x27, 0xa6, 0xdc],
+    ),
+    guid(
+        0x5c014b53,
+        0x68a1,
+        0x4b9b,
+        [0x8b, 0xd1, 0xdd, 0x60, 0x46, 0xb9, 0x35, 0x8b],
+    ),
+    guid(
+        0x728f1fa2,
+        0xea11,
+        0x4a9f,
+        [0x9b, 0x52, 0x9b, 0x42, 0xa4, 0x84, 0xd5, 0xc9],
+    ),
+    guid(
+        0x5405c344,
+        0xd457,
+        0x444e,
+        [0xb4, 0xdd, 0x23, 0x66, 0xe4, 0x5a, 0xee, 0x39],
+    ),
+];
+
+fn is_device(iid: *const Iid) -> bool {
+    object::is(iid, &[IID]) || object::is(iid, &LEVEL_IIDS)
+}
+
+/// The interface version these layouts were checked against (2.4). Both
+/// Minecraft (March 2022) and the title (April 2026) pass it.
 pub const CHECKED_VERSION: u32 = 0x0002_0004;
 
 /// Feature level 12_2, what the console hardware supports.
@@ -78,19 +142,34 @@ pub extern "system" fn create(
             "device layouts were checked against {CHECKED_VERSION:#x} only"
         );
     }
-    if *iid != IID {
+    if !is_device(iid) {
         tracing::warn!(iid = %guid_text(iid), "device created as an unknown interface");
         return E_NOINTERFACE;
     }
     if out.is_null() {
         return S_FALSE;
     }
+    if *iid == LEVEL_IIDS[8] {
+        NEWER.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     object::answer(object::DEVICE, iid, Some(device()), out)
+}
+
+/// Set when the title creates the device as `ID3D12Device11`. Its lists and
+/// queues then have the newer layouts (two more methods each; see
+/// `list` and `queue`), although the interface version stays 2.4.
+/// shortcut: the creation interface is the only sign of the newer layouts
+/// we have (the title, April 2026, versus Minecraft, March 2022);
+/// look for a better one if a title breaks the rule.
+static NEWER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn newer() -> bool {
+    NEWER.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The device, or its DXGI side.
 extern "system" fn query_interface(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    let found = if object::is(iid, &[IID]) {
+    let found = if is_device(iid) {
         Some(this)
     } else if object::is(iid, &dxgi::DEVICE_IIDS) {
         Some(dxgi::device())
@@ -98,6 +177,55 @@ extern "system" fn query_interface(this: This, iid: *const Iid, out: *mut This) 
         None
     };
     object::answer(object::DEVICE, iid, found, out)
+}
+
+/// What `D3D12ConfigureVirtualMemoryX` takes and fills in.
+#[repr(C)]
+pub struct VirtualMemory {
+    flags: u32,
+    /// GPU page table size in 4 MiB pages.
+    page_table_pages: u32,
+    /// Memory kept across title processes for the frame buffer.
+    preserved_bytes: u32,
+    /// Out: the range graphics addresses fall in.
+    lowest: u64,
+    highest: u64,
+}
+const _: () = assert!(size_of::<VirtualMemory>() == 0x20);
+
+/// `d3d12_xs!D3D12ConfigureVirtualMemoryX`, called before any graphics
+/// allocation. The inputs size console structures we do not have; the
+/// range out is all of user space, since GPU addresses are CPU addresses.
+pub extern "system" fn configure_virtual_memory(config: *mut VirtualMemory) -> HRESULT {
+    // SAFETY: the title passes its configuration (null is tolerated).
+    let Some(config) = (unsafe { config.as_mut() }) else {
+        return E_INVALIDARG;
+    };
+    tracing::info!(
+        flags = config.flags,
+        page_table_pages = config.page_table_pages,
+        preserved_bytes = config.preserved_bytes,
+        "graphics virtual memory"
+    );
+    (config.lowest, config.highest) = user_space();
+    S_OK
+}
+
+fn user_space() -> (u64, u64) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+        // SAFETY: plain data, filled in by the call.
+        let mut info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer.
+        unsafe { GetSystemInfo(&mut info) };
+        (
+            info.lpMinimumApplicationAddress as u64,
+            info.lpMaximumApplicationAddress as u64,
+        )
+    }
+    #[cfg(not(windows))]
+    (0x1_0000, 0x7fff_fffe_ffff)
 }
 
 extern "system" fn node_count(_: This) -> u32 {
@@ -217,9 +345,13 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// IUnknown 3, object methods 4, device methods 76.
-static FUNCTIONS: Table<83> = {
-    let mut f = object::d3d12_object(object::missing_table::<{ object::DEVICE }, 83>());
+/// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
+/// methods `ID3D12Device1` to `ID3D12Device8` add, in order: 3, 1, 3, 6, 9,
+/// 1, 2, 9 (0x298-0x3a0, the console's own among them), then those of
+/// `ID3D12Device9` to `ID3D12Device11`, whose console layout is unknown.
+/// Every slot exists so that a call to one we have not written logs it.
+static FUNCTIONS: Table<160> = {
+    let mut f = object::d3d12_object(object::missing_table::<{ object::DEVICE }, 160>());
     f[0] = query_interface as *const (); // 0x00
     f[7] = node_count as *const (); // 0x38
     f[8] = queue::create as *const (); // 0x40
@@ -231,8 +363,16 @@ static FUNCTIONS: Table<83> = {
     f[14] = descriptor::create_heap as *const (); // 0x70
     f[15] = descriptor::increment_size as *const (); // 0x78
     f[16] = root::create as *const (); // 0x80
+    f[17] = descriptor::create_cbv as *const (); // 0x88
+    f[18] = descriptor::create_srv as *const (); // 0x90
+    f[19] = descriptor::create_uav as *const (); // 0x98
     f[20] = descriptor::create_rtv as *const (); // 0xa0
+    f[21] = descriptor::create_dsv as *const (); // 0xa8
+    f[22] = descriptor::create_sampler as *const (); // 0xb0
+    f[23] = descriptor::copy as *const (); // 0xb8
+    f[24] = descriptor::copy_simple as *const (); // 0xc0
     f[25] = resource::allocation_info as *const (); // 0xc8
+    f[26] = resource::custom_heap_properties as *const (); // 0xd0
     f[27] = resource::create_committed as *const (); // 0xd8
     f[28] = resource::create_heap as *const (); // 0xe0
     f[29] = resource::create_placed as *const (); // 0xe8
@@ -240,12 +380,26 @@ static FUNCTIONS: Table<83> = {
     f[38] = resource::copyable_footprints as *const (); // 0x130
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
+    f[48] = queue::create_x as *const (); // 0x180
+    f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
+    f[62] = pipeline::create_compute_x as *const (); // 0x1f0
     f[69] = object::ignore as *const (); // 0x228 debug error filter
+    f[70] = descriptor::create_placed_srv as *const (); // 0x230
+    f[71] = descriptor::create_placed_uav as *const (); // 0x238
     f[73] = list::create_list_x as *const (); // 0x248
+    f[74] = resource::register_page_pool as *const (); // 0x250
+    f[75] = resource::unregister_page_pool as *const (); // 0x258
+    // CreateCommittedResourceX: its description is PC's plus DCC options,
+    // which we have no use for (the AMD upscaler's, on Series S).
+    f[76] = resource::create_committed as *const (); // 0x260
     f[78] = frame::set_interval as *const (); // 0x270
     f[79] = frame::schedule as *const (); // 0x278
     f[80] = frame::wait as *const (); // 0x280
     f[81] = frame::statistics as *const (); // 0x288
+    f[86] = pipeline::create_stream as *const (); // 0x2b0
+    f[108] = resource::allocation_info2 as *const (); // 0x360
+    f[127] = resource::create_committed3 as *const (); // 0x3f8
+    f[133] = resource::create_at_address as *const (); // 0x428
     Table(f)
 };
 
@@ -274,8 +428,37 @@ mod tests {
             slot::<extern "system" fn(This) -> u32>(device, 0x38)(device),
             1
         );
-        let missing = slot::<extern "system" fn() -> HRESULT>(device, 0x88);
+        let missing = slot::<extern "system" fn() -> HRESULT>(device, 0xf0);
         assert_eq!(missing(), E_NOTIMPL);
+    }
+
+    #[test]
+    fn newer_device_levels_are_the_same_device() {
+        // ID3D12Device11, as the title asks for it.
+        let (hr, device) = create_as(&LEVEL_IIDS[8]);
+        assert_eq!((hr, device), (S_OK, super::device()));
+        let mut same = std::ptr::null();
+        assert_eq!(query_interface(device, &LEVEL_IIDS[4], &mut same), S_OK);
+        assert_eq!(same, device);
+        // A Device8 method we have not written fails without crashing.
+        let missing = slot::<extern "system" fn() -> HRESULT>(device, 0x3a0);
+        assert_eq!(missing(), E_NOTIMPL);
+    }
+
+    #[test]
+    fn virtual_memory_configuration_reports_user_space() {
+        let mut config = VirtualMemory {
+            flags: 0,
+            page_table_pages: 7,
+            preserved_bytes: 0,
+            lowest: 0,
+            highest: 0,
+        };
+        assert_eq!(configure_virtual_memory(&mut config), S_OK);
+        assert!(0 < config.lowest && config.lowest < config.highest);
+        let heap = Box::new(0u8);
+        assert!((config.lowest..=config.highest).contains(&(&raw const *heap as u64)));
+        assert_eq!(configure_virtual_memory(std::ptr::null_mut()), E_INVALIDARG);
     }
 
     #[test]

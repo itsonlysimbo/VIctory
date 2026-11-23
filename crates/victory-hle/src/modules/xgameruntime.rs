@@ -8,10 +8,13 @@
 //! releases it. Until an area is implemented its query fails, and the call
 //! returns that error without touching the object. An area's interface id
 //! changes when its method table does, so each object answers only the ids
-//! whose slots we know. Implemented: task queues and async blocks
-//! (`xasync`), one offline user (`xuser`), system information (`xsystem`),
-//! title id, feature checks, invites and events (`xgame`), persistent local
-//! storage (`storage`).
+//! whose slots we know. Implemented, as an offline retail console with one
+//! signed-in user: task queues and async blocks (`xasync`), the user
+//! (`xuser`), system information (`xsystem`), title id, feature checks,
+//! invites and events (`xgame`), persistent local storage (`storage`), game
+//! saves (`xgamesave`), networking (`xnetworking`), the package
+//! (`xpackage`), the store (`xstore`), system dialogs (`xgameui`), speech
+//! (`speech`), HDR, URIs, display deferrals and screenshots (`display`).
 #![allow(non_snake_case)]
 // Title code calls these through its import table, passing pointers the real
 // API would trust.
@@ -21,7 +24,10 @@ use std::ffi::{CStr, c_char, c_void};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{storage, xasync, xgame, xsystem, xuser};
+use super::{
+    display, speech, storage, xasync, xgame, xgamesave, xgameui, xnetworking, xpackage, xstore,
+    xsystem, xuser,
+};
 use crate::{HleModule, hle_export};
 
 pub type HRESULT = i32;
@@ -91,12 +97,19 @@ unsafe impl<const N: usize> Sync for Methods<N> {}
 /// A (provider, interface id) pair a title may ask for, and our object.
 pub type Interface = (Guid, Guid, &'static Object);
 
-const AREAS: [&[Interface]; 5] = [
+const AREAS: &[&[Interface]] = &[
     xasync::INTERFACES,
     xuser::INTERFACES,
     xsystem::INTERFACES,
     xgame::INTERFACES,
     storage::INTERFACES,
+    xnetworking::INTERFACES,
+    xpackage::INTERFACES,
+    display::INTERFACES,
+    xgamesave::INTERFACES,
+    xstore::INTERFACES,
+    xgameui::INTERFACES,
+    speech::INTERFACES,
 ];
 
 /// `AddRef` and `Release`.
@@ -146,6 +159,12 @@ pub fn put_string(text: &str, size: usize, buffer: *mut u8, used: *mut usize) ->
     S_OK
 }
 
+/// The title's NUL-terminated string, if any.
+pub fn text(s: *const c_char) -> Option<String> {
+    // SAFETY: the title passes a NUL-terminated string or null.
+    (!s.is_null()).then(|| unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned())
+}
+
 /// A new registration token for callbacks we never call (events nobody
 /// raises offline).
 pub fn token() -> u64 {
@@ -181,6 +200,19 @@ pub extern "system" fn InitializeApiImplEx(version: u64, build: u64, flags: u64)
     S_OK
 }
 
+/// The stub prefers this one when present. It passes the same three values
+/// and a pointer to the title's initialisation options, null unless the
+/// title initialises with options (the title does not).
+pub extern "system" fn InitializeApiImplEx2(
+    version: u64,
+    build: u64,
+    flags: u64,
+    options: *const c_void,
+) -> HRESULT {
+    tracing::info!(version, build, flags, ?options, "InitializeApiImplEx2");
+    S_OK
+}
+
 pub extern "system" fn UninitializeApiImpl() {
     tracing::info!("UninitializeApiImpl");
 }
@@ -198,6 +230,17 @@ pub extern "system" fn QueryApiImpl(
     else {
         return NOT_SUPPORTED;
     };
+    #[cfg(feature = "diagnostics")]
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        // Each runtime call site once: which title code uses which area, when.
+        static CALLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let from = super::kernel::callers();
+        let mut calls = CALLS.lock().unwrap_or_else(|e| e.into_inner());
+        if !calls.contains(&from) {
+            tracing::debug!(%provider, %iid, %from, "runtime call");
+            calls.push(from);
+        }
+    }
     let found = AREAS
         .iter()
         .flat_map(|area| area.iter())
@@ -236,6 +279,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(XGameRuntimeUninitialize),
             hle_export!(InitializeApiImpl),
             hle_export!(InitializeApiImplEx),
+            hle_export!(InitializeApiImplEx2),
             hle_export!(UninitializeApiImpl),
             hle_export!(QueryApiImpl),
             hle_export!(XErrorReport),
@@ -257,6 +301,7 @@ mod tests {
         for name in [
             c"InitializeApiImpl",
             c"InitializeApiImplEx",
+            c"InitializeApiImplEx2",
             c"QueryApiImpl",
             c"UninitializeApiImpl",
             c"XErrorReport",

@@ -12,10 +12,18 @@
 //! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share. Planned: `present` (swap chain).
+//! share, [`console`] which console model the title sees. Planned:
+//! `present` (swap chain).
 
+#[cfg(all(windows, feature = "diagnostics"))]
+mod capture;
+pub mod console;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod copystat;
 pub mod descriptor;
 pub mod device;
+#[cfg(windows)]
+mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
@@ -24,8 +32,25 @@ mod host;
 pub mod list;
 pub mod object;
 pub mod pipeline;
+#[cfg(windows)]
+mod primitive;
 pub mod query;
 pub mod queue;
 pub mod resource;
 pub mod root;
+#[cfg(windows)]
+mod sampler;
+#[cfg(windows)]
+pub mod shader_cache;
+#[cfg(windows)]
+mod shadow;
 pub mod signature;
+#[cfg(windows)]
+mod texture;
+#[cfg(windows)]
+mod watch;
+
+#[cfg(windows)]
+pub use host::on_failure;
+#[cfg(windows)]
+pub use watch::{title_memory_remapped, writing as kernel_will_write};

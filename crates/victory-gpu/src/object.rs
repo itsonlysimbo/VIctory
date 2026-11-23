@@ -18,7 +18,7 @@ pub(crate) const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 /// What D3D and DXGI return for a missing item (adapter, output, private
 /// data).
 pub(crate) const NOT_FOUND: HRESULT = 0x887A_0002_u32 as i32;
-const MORE_DATA: HRESULT = 0x887A_0003_u32 as i32;
+pub(crate) const MORE_DATA: HRESULT = 0x887A_0003_u32 as i32;
 
 pub type Iid = [u8; 16];
 
@@ -275,17 +275,52 @@ const MAX_SLOTS: usize = 160;
 static REPORTED: [[AtomicBool; MAX_SLOTS]; KINDS.len()] =
     [const { [const { AtomicBool::new(false) }; MAX_SLOTS] }; KINDS.len()];
 
-/// Logged once per slot. Wrong for a slot that returns a value instead of
+/// Logged once per slot, with the caller's offset in its module (the title
+/// image for title calls). Wrong for a slot that returns a value instead of
 /// an `HRESULT`.
 extern "system" fn missing<const KIND: usize, const SLOT: usize>() -> HRESULT {
     if !REPORTED[KIND][SLOT].swap(true, Ordering::Relaxed) {
         tracing::warn!(
             object = KINDS[KIND],
             slot = format_args!("{:#x}", SLOT * 8),
+            caller = caller(),
             "method not implemented"
         );
     }
     E_NOTIMPL
+}
+
+/// The return address of whoever called our caller, as `+offset` into its
+/// module.
+#[inline(never)]
+fn caller() -> String {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
+        use windows_sys::Win32::System::LibraryLoader::{
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            GetModuleHandleExW,
+        };
+        let mut frame = std::ptr::null_mut();
+        // SAFETY: room for one frame; skips this function and its caller.
+        if unsafe { RtlCaptureStackBackTrace(2, 1, &mut frame, std::ptr::null_mut()) } == 1 {
+            let mut module = std::ptr::null_mut();
+            // SAFETY: looks up the module holding the address, no reference.
+            let found = unsafe {
+                GetModuleHandleExW(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                        | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    frame as *const u16,
+                    &mut module,
+                )
+            };
+            if found != 0 {
+                return format!("+{:#x}", frame as usize - module as usize);
+            }
+            return format!("{frame:?}");
+        }
+    }
+    String::new()
 }
 
 /// Accepts and ignores (debug-only settings).
@@ -298,6 +333,8 @@ macro_rules! missing {
 }
 
 /// A table of `N` slots that log and fail; callers fill in what they have.
+/// Tables are made longer than the interfaces we know, so that a method a
+/// newer title adds logs instead of jumping into whatever follows the table.
 pub(crate) const fn missing_table<const KIND: usize, const N: usize>() -> [*const (); N] {
     let all = missing!(KIND;
         0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31

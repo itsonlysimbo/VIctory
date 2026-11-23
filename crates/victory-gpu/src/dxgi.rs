@@ -4,8 +4,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::object::{
-    self, ADAPTER, DXGI_DEVICE, E_INVALIDARG, FACTORY, HRESULT, Iid, NOT_FOUND, OUTPUT, Object,
-    S_OK, Table, This, guid,
+    self, ADAPTER, DXGI_DEVICE, E_INVALIDARG, FACTORY, HRESULT, Iid, MORE_DATA, NOT_FOUND, OUTPUT,
+    Object, S_OK, Table, This, guid,
 };
 
 /// The DXGI device interfaces, base first (as on PC).
@@ -132,7 +132,6 @@ struct AdapterDescription {
 const _: () = assert!(size_of::<AdapterDescription>() == 0x130);
 
 const AMD: u32 = 0x1002;
-const GIB: usize = 1 << 30;
 
 extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) -> HRESULT {
     if out.is_null() {
@@ -142,17 +141,18 @@ extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) ->
     for (slot, unit) in name.iter_mut().zip("VIctory console GPU".encode_utf16()) {
         *slot = unit;
     }
-    // shortcut: memory sizes are the Series X game split (10 GiB fast,
-    // 3.5 GiB standard), not measured; revisit once memory is emulated.
+    // shortcut: memory sizes are the title's split (GPU-optimal, standard),
+    // not measured; revisit once memory is emulated.
+    let (gpu_optimal, standard) = crate::console::current().title_memory();
     let description = AdapterDescription {
         name,
         vendor: AMD,
         device: 0,
         subsystem: 0,
         revision: 0,
-        dedicated_video_memory: 10 * GIB,
+        dedicated_video_memory: gpu_optimal,
         dedicated_system_memory: 0,
-        shared_system_memory: 7 * GIB / 2,
+        shared_system_memory: standard,
         luid: [1, 0],
     };
     // SAFETY: checked non-null; the title passes room for the description.
@@ -178,8 +178,8 @@ extern "system" fn output_parent(_: This, iid: *const Iid, out: *mut This) -> HR
 }
 
 /// IUnknown 3, object 4, device 5 + 2 + 3.
-static DEVICE_FUNCTIONS: Table<17> = {
-    let mut f = object::missing_table::<DXGI_DEVICE, 17>();
+static DEVICE_FUNCTIONS: Table<32> = {
+    let mut f = object::missing_table::<DXGI_DEVICE, 32>();
     f[0] = device_query as *const ();
     f[6] = device_parent as *const (); // 0x30
     f[7] = device_adapter as *const (); // 0x38
@@ -187,8 +187,8 @@ static DEVICE_FUNCTIONS: Table<17> = {
 };
 
 /// IUnknown 3, object 4, adapter 3 + 1 + 1.
-static ADAPTER_FUNCTIONS: Table<12> = {
-    let mut f = object::missing_table::<ADAPTER, 12>();
+static ADAPTER_FUNCTIONS: Table<24> = {
+    let mut f = object::missing_table::<ADAPTER, 24>();
     f[0] = adapter_query as *const ();
     f[6] = adapter_parent as *const (); // 0x30
     f[7] = adapter_outputs as *const (); // 0x38
@@ -197,19 +197,71 @@ static ADAPTER_FUNCTIONS: Table<12> = {
 };
 
 /// IUnknown 3, object 4, factory 5 + 2 + 11.
-static FACTORY_FUNCTIONS: Table<25> = {
-    let mut f = object::missing_table::<FACTORY, 25>();
+static FACTORY_FUNCTIONS: Table<32> = {
+    let mut f = object::missing_table::<FACTORY, 32>();
     f[0] = factory_query as *const ();
     f[7] = factory_adapters as *const (); // 0x38
     f[12] = factory_adapters as *const (); // 0x60, the same for version 1
     Table(f)
 };
 
+/// A display mode as the console lists it: size, refresh rate (numerator,
+/// denominator), format, scanline order, scaling, flags.
+#[repr(C)]
+struct Mode {
+    width: u32,
+    height: u32,
+    refresh: [u32; 2],
+    format: u32,
+    scanlines: u32,
+    scaling: u32,
+    flags: u32,
+}
+const _: () = assert!(size_of::<Mode>() == 32);
+
+/// The console's mode list: one 4K mode at 60 Hz (the title looks
+/// for a 120 Hz one to allow 120 Hz frame intervals).
+/// shortcut: fixed mode, not the host display's; report the host's rates if
+/// a title paces by them.
+extern "system" fn modes(
+    _: This,
+    _format: u32,
+    _flags: u32,
+    count: *mut u32,
+    out: *mut Mode,
+) -> HRESULT {
+    // SAFETY: the title passes its count (null is tolerated).
+    let Some(count) = (unsafe { count.as_mut() }) else {
+        return E_INVALIDARG;
+    };
+    if out.is_null() {
+        *count = 1;
+        return S_OK;
+    }
+    if *count < 1 {
+        return MORE_DATA;
+    }
+    *count = 1;
+    let mode = Mode {
+        width: 3840,
+        height: 2160,
+        refresh: [60, 1],
+        format: 0,
+        scanlines: 1, // progressive
+        scaling: 0,
+        flags: 0,
+    };
+    // SAFETY: checked non-null; room for `count` >= 1 modes.
+    unsafe { out.write(mode) };
+    S_OK
+}
+
 /// IUnknown 3, object 4, output 15 (12 as on PC, then 3 console ones).
-static OUTPUT_FUNCTIONS: Table<22> = {
-    let mut f = object::missing_table::<OUTPUT, 22>();
+static OUTPUT_FUNCTIONS: Table<32> = {
+    let mut f = object::missing_table::<OUTPUT, 32>();
     f[0] = output_query as *const ();
     f[6] = output_parent as *const (); // 0x30
+    f[21] = modes as *const (); // 0xa8
     Table(f)
 };
 

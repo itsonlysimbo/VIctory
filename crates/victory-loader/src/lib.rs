@@ -25,6 +25,8 @@
 mod crash;
 pub mod prepare;
 pub mod resolve;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod stacks;
 #[cfg(windows)]
 mod threads;
 #[cfg(windows)]
@@ -35,9 +37,15 @@ mod tls;
 mod windows;
 
 #[cfg(windows)]
-pub use crash::{locate, report_crashes};
+pub use crash::{
+    locate, log_crash, log_crashes_to, note_title_output, report_crashes, report_unhandled,
+};
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use crash::save_on_crash;
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use stacks::{dump_stacks, dump_stacks_on_schedule};
 #[cfg(windows)]
 pub use threads::disable_thread_calls;
 #[cfg(windows)]
@@ -49,3 +57,5 @@ pub use windows::{
 
 /// `DLL_PROCESS_ATTACH`, for TLS callbacks.
 pub const DLL_PROCESS_ATTACH: u32 = 1;
+/// `DLL_PROCESS_DETACH`.
+pub const DLL_PROCESS_DETACH: u32 = 0;

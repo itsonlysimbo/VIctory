@@ -35,18 +35,21 @@ impl Source<'_> {
     }
 }
 
-/// The records of an SGD5 file, or else every container found by its magic.
+/// The packed records of SGD5 data, and every container stored as is (the
+/// executable keeps some records uncompressed), found by its magic.
 pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
+    let mut out: Vec<Source<'_>> = Vec::new();
     if sgd5::is_sgd5(data) {
-        return sgd5::records(data).map(Source::Packed).collect();
+        out.extend(sgd5::records(data).map(Source::Packed));
     }
-    memchr::memmem::find_iter(data, b"DXBC")
+    let raw = memchr::memmem::find_iter(data, b"DXBC")
         .filter(|&offset| Container::parse(&data[offset..]).is_ok())
         .map(|offset| Source::Raw {
             offset,
             data: &data[offset..],
-        })
-        .collect()
+        });
+    out.extend(raw);
+    out
 }
 
 #[derive(Default)]
@@ -119,6 +122,9 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                                         *t.unnamed.entry(key).or_default() += 1;
                                     }
                                     if disasm {
+                                        listing
+                                            .extend(n.layout.iter().map(|p| format!("    {p:?}")));
+                                        listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
                                         listing.extend(
                                             insts.iter().map(|i| format_instruction(i, n.wave64)),
                                         );

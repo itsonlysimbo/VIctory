@@ -90,13 +90,27 @@ unsafe extern "system" fn on_thread(_: *mut c_void, reason: u32, _: *mut c_void)
 #[unsafe(link_section = ".CRT$XLB")]
 static ON_THREAD: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) = on_thread;
 
-/// Called by the CRT's DLL entry point: counts thread starts too.
+/// Called by the CRT's DLL entry point: counts thread starts too, and calls
+/// an import the resolver overrides, as title code calls our runtime.
 #[unsafe(no_mangle)]
 pub extern "system" fn DllMain(_: *mut c_void, reason: u32, _: *mut c_void) -> i32 {
     if reason == DLL_THREAD_ATTACH {
         MAIN_THREAD_STARTS.fetch_add(1, Ordering::Relaxed);
+        unsafe { GetTickCount() };
+    }
+    if reason == DLL_PROCESS_DETACH {
+        DETACHES.fetch_add(1, Ordering::Relaxed);
     }
     1
+}
+
+const DLL_PROCESS_DETACH: u32 = 0;
+static DETACHES: AtomicU32 = AtomicU32::new(0);
+
+/// `DLL_PROCESS_DETACH` notices seen by `DllMain`.
+#[unsafe(no_mangle)]
+pub extern "system" fn probe_detaches() -> u32 {
+    DETACHES.load(Ordering::Relaxed)
 }
 
 /// Thread starts seen by the TLS callback (high half) and `DllMain` (low).

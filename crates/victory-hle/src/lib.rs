@@ -18,6 +18,7 @@ pub mod runtime;
 
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
+pub use victory_gpu::console;
 
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;
@@ -101,7 +102,10 @@ mod tests {
             Some(Provenance::Host)
         );
         // Console-only DLLs never pass through.
-        assert_eq!(r.classify("xmem.dll", &name("XMemAllocDefault")), None);
+        assert_eq!(
+            r.classify("xmem.dll", &name("XMemSetAllocationHooks")),
+            None
+        );
     }
 
     #[cfg(windows)]

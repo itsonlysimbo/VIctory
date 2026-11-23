@@ -308,6 +308,12 @@ pub struct Structured {
     pub guards: Vec<Vec<Option<Bool>>>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
     pub masks: HashMap<Value, Bool>,
+    /// Wave64 masks: low dword's value by the high dword's.
+    pub highs: HashMap<Value, Value>,
+    /// Masks (low dwords) set only in lanes whose EXEC bit is set where
+    /// they are written: every such lane reaches the writing block, so a
+    /// ballot there gives the mask as data.
+    pub active: HashSet<Value>,
 }
 
 /// Builds the per-lane form of `program`.
@@ -356,6 +362,8 @@ struct Lanes<'a> {
     first: Vec<Bool>,
     /// Per block ending in a branch: when a lane takes it.
     when: Vec<Option<Bool>>,
+    /// See [`Structured::active`].
+    active: HashSet<Value>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -418,6 +426,7 @@ impl<'a> Lanes<'a> {
             joins: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
+            active: HashSet::new(),
         })
     }
 
@@ -429,6 +438,7 @@ impl<'a> Lanes<'a> {
         self.joins.clear();
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
+        self.active.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -443,6 +453,7 @@ impl<'a> Lanes<'a> {
                 lo
             };
             self.masks.insert((lo, hi), Bool::TRUE);
+            self.active.insert(lo);
         }
         let mut execs: Vec<Vec<Option<Bool>>> =
             p.blocks.iter().map(|b| vec![None; b.insts.len()]).collect();
@@ -457,11 +468,24 @@ impl<'a> Lanes<'a> {
                 }
             }
             self.first[b] = c;
+            // EXEC joined at the block's entry holds the lanes that arrive.
+            for phi in &p.blocks[b].phis {
+                if phi.reg == Reg::S(EXEC) {
+                    self.active.insert(phi.value);
+                }
+            }
+            // EXEC where known in this block (read or written so far).
+            let mut now = None;
             for (i, inst) in p.blocks[b].insts.iter().enumerate() {
                 if inst.read(Reg::S(EXEC)).is_some() {
-                    execs[b][i] = Some(self.exec(inst));
+                    let e = self.exec(inst);
+                    execs[b][i] = Some(e);
+                    now = Some(e);
                 }
-                self.step(inst);
+                self.step(inst, now);
+                if let Some(k) = self.key(|r| inst.write(r), EXEC) {
+                    now = self.masks.get(&k).or(self.other.get(&k)).copied();
+                }
             }
             if let Exit::Branch { .. } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
@@ -553,6 +577,13 @@ impl<'a> Lanes<'a> {
         }
         Ok(Structured {
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            highs: self
+                .masks
+                .keys()
+                .filter(|(lo, hi)| lo != hi)
+                .map(|&(lo, hi)| (hi, lo))
+                .collect(),
+            active: self.active,
             bools: self.b,
             exits,
             guards,
@@ -828,8 +859,8 @@ impl<'a> Lanes<'a> {
         })
     }
 
-    /// Records the masks `inst` defines.
-    fn step(&mut self, inst: &Inst) {
+    /// Records the masks `inst` defines; `exec` is EXEC there, if known.
+    fn step(&mut self, inst: &Inst, exec: Option<Bool>) {
         let name = inst.name();
         match &inst.fields {
             Fields::Sop { src, .. } => {
@@ -850,6 +881,12 @@ impl<'a> Lanes<'a> {
                 {
                     for (k, m) in r.dst.into_iter().chain(r.exec) {
                         self.masks.insert(k, m);
+                        // EXEC itself holds the lanes that run here.
+                        if r.exec.is_some_and(|e| e.0 == k)
+                            || exec.is_some_and(|e| self.b.implies(m, e))
+                        {
+                            self.active.insert(k.0);
+                        }
                     }
                     if let (Some(scc), Some(m)) = (inst.write(Reg::Scc), r.scc) {
                         self.scc_lane.insert(scc, m);
@@ -883,7 +920,17 @@ impl<'a> Lanes<'a> {
                     let a = l.b.atom(Atom::Lane(k.0), born);
                     let m = l.b.and(exec, a);
                     l.masks.insert(k, m);
+                    l.active.insert(k.0);
                 };
+                // A select reads a mask nothing else may: a join of compare
+                // results is resolved here, as for EXEC.
+                if name == "v_cndmask_b32"
+                    && let Some(&Operand::Scalar { code, .. }) = v.src.get(2)
+                    && code != NULL
+                    && let Some(k) = self.key(|r| inst.read(r), code)
+                {
+                    self.mask(k);
+                }
                 if name.starts_with("v_cmpx") {
                     if let Some(k) = self.key(|r| inst.write(r), EXEC) {
                         lane(self, k);

@@ -34,11 +34,14 @@ toml = "1.2.2"
 object = { version = "0.41.0", default-features = false, features = ["read_core", "pe", "coff", "archive", "std"] }
 windows-sys = "0.61.2"
 windows = "0.62.2"
+windows-core = "0.62.2"
 blake3 = "1.8.7"
 memchr = "2.8.3"
 miniz_oxide = "0.9.1"
 walkdir = "2.5.1"
 tempfile = "3.27.0"
+# Opus decoding for the console's audio decoder (BSD-3-Clause, pure Rust).
+opus-pure = "0.2.4"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -55,3 +58,9 @@ opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"
+
+# The development build: release code generation plus the `diagnostics`
+# feature (`cargo build --profile diag -p victory --features diagnostics`),
+# kept in its own folder so it does not evict the plain release build.
+[profile.diag]
+inherits = "release"

@@ -360,7 +360,32 @@ pub(crate) fn irreducible_edge(
     index: &[usize],
 ) -> Option<(usize, usize)> {
     let &entry = order.first()?;
+    let idom = idoms(blocks, order, index);
+    for &b in order {
+        for s in blocks[b].exit.successors() {
+            if index[s] > index[b] {
+                continue;
+            }
+            let mut d = b;
+            while d != s && d != entry {
+                d = idom[d];
+            }
+            if d != s {
+                return Some((b, s));
+            }
+        }
+    }
+    None
+}
+
+/// Each block's immediate dominator (the entry's is itself, unreachable
+/// blocks' `usize::MAX`); `order` is reverse postorder, `index` each
+/// block's position in it.
+pub(crate) fn idoms(blocks: &[Block], order: &[usize], index: &[usize]) -> Vec<usize> {
     let mut idom = vec![usize::MAX; blocks.len()];
+    let Some(&entry) = order.first() else {
+        return idom;
+    };
     idom[entry] = entry;
     let intersect = |idom: &[usize], mut a: usize, mut b: usize| {
         while a != b {
@@ -391,21 +416,7 @@ pub(crate) fn irreducible_edge(
             }
         }
     }
-    for &b in order {
-        for s in blocks[b].exit.successors() {
-            if index[s] > index[b] {
-                continue;
-            }
-            let mut d = b;
-            while d != s && d != entry {
-                d = idom[d];
-            }
-            if d != s {
-                return Some((b, s));
-            }
-        }
-    }
-    None
+    idom
 }
 
 /// Node splitting, before SSA. While a loop is entered at several blocks
@@ -692,6 +703,13 @@ fn effects(
             }
             if let Some(d) = dst {
                 regs(d, &mut w)?;
+                // These change (or may keep) the destination's old value.
+                if name.starts_with("s_bitset")
+                    || name.starts_with("s_cmov")
+                    || matches!(name, "s_addk_i32" | "s_mulk_i32")
+                {
+                    regs(d, &mut r)?;
+                }
             }
             if matches!(name, "s_addc_u32" | "s_subb_u32" | "s_cmovk_i32")
                 || name.starts_with("s_cselect_")
@@ -1061,6 +1079,25 @@ mod tests {
             assert_eq!(mov1.read(Reg::S(EXEC + 1)).is_some(), wave64);
             assert_eq!((end.name(), b2.exit), ("s_endpgm", Exit::End));
         }
+    }
+
+    #[test]
+    fn in_place_scalar_ops_read_their_destination() {
+        let p = build_words(
+            &[
+                0xBE8D_1D94, // s_bitset1_b32 s13, 20
+                0xB78E_0010, // s_addk_i32 s14, 0x10
+                0xBE8F_0380, // s_mov_b32 s15, 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let [bitset, addk, mov, _] = &p.blocks[0].insts[..] else {
+            panic!("{:?}", p.blocks[0].insts)
+        };
+        assert_eq!(bitset.read(Reg::S(13)), Some(input(&p, Reg::S(13))));
+        assert_eq!(addk.read(Reg::S(14)), Some(input(&p, Reg::S(14))));
+        assert_eq!(mov.read(Reg::S(15)), None);
     }
 
     #[test]

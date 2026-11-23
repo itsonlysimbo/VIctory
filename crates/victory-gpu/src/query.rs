@@ -63,8 +63,8 @@ extern "system" fn release(this: This) -> u32 {
 }
 
 /// IUnknown 3, object 4, device child 1.
-static FUNCTIONS: Table<8> = {
-    let mut f = object::d3d12_object(object::missing_table::<QUERY_HEAP, 8>());
+static FUNCTIONS: Table<24> = {
+    let mut f = object::d3d12_object(object::missing_table::<QUERY_HEAP, 24>());
     f[0] = query as *const ();
     f[2] = release as *const ();
     f[7] = object::parent_device as *const (); // 0x38

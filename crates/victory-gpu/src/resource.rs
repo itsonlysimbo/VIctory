@@ -1,14 +1,15 @@
 //! Heaps, committed and placed resources, and resource sizes.
 //!
-//! shortcut: heaps and resources are plain host memory and a resource's
-//! GPU address is its CPU address, as on the console. Rewrite them on host
-//! D3D12 heaps and resources once the command-stream decoder needs the host
-//! GPU to see them (TODO.md, GPU).
+//! Heaps and resources are host memory and a resource's GPU address is its
+//! CPU address, as on the console; textures also get a host copy, and
+//! buffers a host copy when a draw reads them (`shadow`).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ffi::c_void;
 use std::ptr::NonNull;
+
+use victory_formats::texture;
 
 use crate::object::{
     self, E_INVALIDARG, E_OUTOFMEMORY, HEAP, HRESULT, Iid, Object, RESOURCE, S_OK, Table, This,
@@ -112,29 +113,83 @@ const BUFFER: u32 = 1;
 const TEXTURE_3D: u32 = 4;
 
 /// Bytes per element and the element's width in texels (4 for block
-/// compression), by DXGI format number. `None` for 1-bit, video and
-/// console-only formats.
-fn element(format: u32) -> Option<(u64, u64)> {
+/// compression), by DXGI format number. `None` for 1-bit and video
+/// formats. The console adds 116/117 (10-bit float color), 118-120 (16-bit
+/// depth with 8-bit stencil, two planes: 3 bytes per texel), 189 (signed
+/// 10-bit color), 190 (two 4-bit channels) and 191 (24/8 color).
+pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
     Some(match format {
         1..=4 => (16, 1),
         5..=8 => (12, 1),
         9..=22 => (8, 1),
-        23..=47 | 67 | 87..=93 => (4, 1),
+        23..=47 | 67 | 87..=93 | 116 | 117 | 189 | 191 => (4, 1),
+        118..=120 => (3, 1),
         48..=59 | 68 | 69 | 85 | 86 | 115 => (2, 1),
-        60..=65 => (1, 1),
+        60..=65 | 190 => (1, 1),
         70..=72 | 79..=81 => (8, 4),
         73..=78 | 82..=84 | 94..=99 => (16, 4),
         _ => return None,
     })
 }
 
-/// Bytes and alignment a resource takes in our layout: every mip of every
-/// array slice and sample, packed, rounded up to 64 KiB.
-///
-/// shortcut: an unpadded bound, not the console's tiled layout. Titles that
-/// write console-tiled data straight into memory may need more; revisit with
-/// the texture layouts (TODO.md, formats).
+/// A texture's layout in console memory, as the console's layout library
+/// gives it (`victory-hle`'s `xg` serves the same): the description's
+/// layout field is `0x100 | swizzle mode`, 1 linear, 0 the library's pick.
+pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
+    use texture::{Dimension, Swizzle, TextureDesc};
+    const TEXTURE_1D: u32 = 2;
+    const TEXTURE_2D: u32 = 3;
+    const RENDER_TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
+    let dimension = match desc.dimension {
+        TEXTURE_1D => Dimension::Tex1d,
+        TEXTURE_2D => Dimension::Tex2d,
+        TEXTURE_3D => Dimension::Tex3d,
+        _ => return None,
+    };
+    let swizzle = match desc.layout {
+        0 if dimension == Dimension::Tex1d => Swizzle::LINEAR,
+        0 if desc.flags & DEPTH != 0 => Swizzle::SW_64KB_Z_X,
+        0 if desc.flags & RENDER_TARGET != 0 => Swizzle::SW_64KB_R_X,
+        0 => Swizzle::SW_4KB_S,
+        1 => Swizzle::LINEAR,
+        l if l & !0xff == 0x100 => Swizzle(l & 0xff),
+        _ => return None,
+    };
+    texture::Texture::new(&TextureDesc {
+        dimension,
+        width: u32::try_from(desc.width).ok()?,
+        height: desc.height,
+        depth_or_array: u32::from(desc.depth_or_array_size),
+        mips: u32::from(desc.mip_levels),
+        format: desc.format,
+        samples: desc.sample_count.max(1),
+        swizzle,
+    })
+    .ok()
+}
+
+/// Bytes and alignment a resource takes: buffers their width (64 KiB
+/// aligned), textures their console layout (formats it does not know:
+/// every mip of every array slice and sample, packed, 64 KiB aligned),
+/// rounded up to the alignment.
 fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
+    if desc.dimension != BUFFER
+        && let Some(t) = texture_layout(desc)
+    {
+        // As the console: the layout's own alignment unless more is asked
+        // (4 KiB for 4 KiB modes, where PC says 64 KiB).
+        // The title keeps these sizes in its texture tables, and its streaming
+        // asserts when they disagree with the streamed layout.
+        let alignment = desc.alignment.max(t.alignment);
+        if !alignment.is_power_of_two() {
+            return None;
+        }
+        return Some(AllocationInfo {
+            size: t.size.checked_next_multiple_of(alignment)?,
+            alignment,
+        });
+    }
     let bytes = if desc.dimension == BUFFER {
         desc.width
     } else {
@@ -170,6 +225,72 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         alignment,
     })
 }
+
+/// A format as the host has it. The console's 16-bit depth with stencil
+/// (and its typeless views) has no PC format: the 24-bit ones stand in.
+pub(crate) fn pc_format(format: u32) -> u32 {
+    match format {
+        118 => 45,
+        119 => 46,
+        120 => 47,
+        other => other,
+    }
+}
+
+/// The typeless format of a format's family (itself if it has none).
+pub(crate) fn family(format: u32) -> u32 {
+    const FAMILIES: [(u32, u32); 22] = [
+        (1, 4),
+        (5, 8),
+        (9, 14),
+        (15, 18),
+        (19, 22),
+        (23, 25),
+        (27, 32),
+        (33, 38),
+        (39, 43),
+        (44, 47),
+        (48, 52),
+        (53, 59),
+        (60, 65),
+        (70, 72),
+        (73, 75),
+        (76, 78),
+        (79, 81),
+        (82, 84),
+        (90, 91),
+        (92, 93),
+        (94, 96),
+        (97, 99),
+    ];
+    match format {
+        87 => 90,
+        88 => 92,
+        f => FAMILIES
+            .iter()
+            .find(|&&(first, last)| (first..=last).contains(&f))
+            .map_or(f, |&(first, _)| first),
+    }
+}
+
+/// sRGB formats and their linear twins.
+pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
+
+/// The format a view of a title texture must name when its host copy is
+/// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
+/// the host copy is typed.
+pub(crate) fn view_format(this: This) -> Option<u32> {
+    let own = pc_format(resource(this).desc.format);
+    let host = host_resource(this)?;
+    // SAFETY: a live resource.
+    let format = unsafe { host.GetDesc() }.Format.0 as u32;
+    (format != own).then_some(own)
+}
+
+/// Depth formats with their typeless family: depth textures that shaders
+/// read are made typeless on the host, which only allows views of
+/// typeless depth resources.
+pub(crate) const DEPTH_FORMATS: [(u32, u32); 4] = [(20, 19), (40, 39), (45, 44), (55, 53)];
 
 /// Mip levels, the full chain for 0.
 fn mip_count(desc: &ResourceDesc) -> u32 {
@@ -342,34 +463,170 @@ pub(crate) extern "system" fn allocation_info(
         // SAFETY: the title passes `count` descriptions.
         unsafe { std::slice::from_raw_parts(descs, count as usize) }
     };
+    // SAFETY: the caller passes room for the value.
+    unsafe { out.write(place(descs.iter(), |_, _| ())) };
+    out
+}
+
+/// The newer description: the plain one, then a sampler feedback mip
+/// region (width, height, depth).
+#[repr(C)]
+pub(crate) struct ResourceDesc1 {
+    desc: ResourceDesc,
+    mip_region: [u32; 3],
+}
+const _: () = assert!(size_of::<ResourceDesc1>() == 72);
+
+/// Where one resource goes in [`allocation_info2`]'s placement.
+#[repr(C)]
+pub(crate) struct AllocationInfo1 {
+    offset: u64,
+    alignment: u64,
+    size: u64,
+}
+
+/// Device method 0x360 (`ID3D12Device8`): [`allocation_info`] for newer
+/// descriptions, also telling where each resource goes.
+pub(crate) extern "system" fn allocation_info2(
+    out: *mut AllocationInfo,
+    _: This,
+    _visible: u32,
+    count: u32,
+    descs: *const ResourceDesc1,
+    each: *mut AllocationInfo1,
+) -> *mut AllocationInfo {
+    let descs = if descs.is_null() {
+        &[][..]
+    } else {
+        // SAFETY: the title passes `count` descriptions.
+        unsafe { std::slice::from_raw_parts(descs, count as usize) }
+    };
+    let total = place(descs.iter().map(|d| &d.desc), |i, info| {
+        if !each.is_null() {
+            // SAFETY: the title passes room for `count` entries.
+            unsafe { each.add(i).write(info) };
+        }
+    });
+    // SAFETY: the caller passes room for the value.
+    unsafe { out.write(total) };
+    out
+}
+
+/// Resources placed one after another: the whole footprint, telling `each`
+/// where every resource goes. Unknown sizes give the documented `u64::MAX`.
+fn place<'a>(
+    descs: impl Iterator<Item = &'a ResourceDesc>,
+    mut each: impl FnMut(usize, AllocationInfo1),
+) -> AllocationInfo {
     let mut total = AllocationInfo {
         size: 0,
         alignment: KIB_64,
     };
-    for desc in descs {
+    for (i, desc) in descs.enumerate() {
         let Some(one) = footprint(desc) else {
             tracing::warn!(?desc, "no size for this resource");
-            total = AllocationInfo {
+            each(
+                i,
+                AllocationInfo1 {
+                    offset: u64::MAX,
+                    alignment: 0,
+                    size: u64::MAX,
+                },
+            );
+            return AllocationInfo {
                 size: u64::MAX,
                 alignment: 0,
             };
-            break;
         };
-        total.size = total.size.next_multiple_of(one.alignment) + one.size;
+        tracing::debug!(?desc, ?one, "allocation info");
+        let offset = total.size.next_multiple_of(one.alignment);
+        each(
+            i,
+            AllocationInfo1 {
+                offset,
+                alignment: one.alignment,
+                size: one.size,
+            },
+        );
+        total.size = offset + one.size;
         total.alignment = total.alignment.max(one.alignment);
     }
-    // SAFETY: the caller passes room for the value.
-    unsafe { out.write(total) };
-    out
+    total
 }
 
 /// Zeroed host memory standing in for GPU memory.
 pub(crate) struct Memory {
     ptr: NonNull<u8>,
     layout: Layout,
+    /// Set when the memory came from the title's allocator, with these
+    /// allocation attributes (it goes back there).
+    attributes: Option<u64>,
+}
+
+pub type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
+pub type FreeRoutine = extern "system" fn(*mut c_void, u64);
+static ALLOCATOR: std::sync::OnceLock<(AllocRoutine, FreeRoutine)> = std::sync::OnceLock::new();
+
+/// Committed resources get their memory from the title's general
+/// allocator, as on the console, where titles hook it to place graphics
+/// memory themselves (the title places its back buffers in a
+/// block of its own and checks they fill it). The runtime names it before
+/// the device exists.
+pub fn use_allocator(alloc: AllocRoutine, free: FreeRoutine) {
+    let _ = ALLOCATOR.set((alloc, free));
+}
+
+/// Maps the physical pages behind one range of title memory at another,
+/// `(to, from, len)` (`from` 0 unmaps); false on failure.
+pub type PageMapper = fn(u64, u64, u64) -> bool;
+static PAGE_MAPPER: std::sync::OnceLock<PageMapper> = std::sync::OnceLock::new();
+
+/// The runtime's page mapper, for the queues' page-mapping copies (memory
+/// is the runtime's, as on the console).
+pub fn use_page_mapper(mapper: PageMapper) {
+    let _ = PAGE_MAPPER.set(mapper);
+}
+
+pub(crate) fn page_mapper() -> Option<PageMapper> {
+    PAGE_MAPPER.get().copied()
+}
+
+/// Allocation attributes for resource memory: allocator id, page size
+/// (bits 14-15: 2 MiB pages from 2 MiB up, else 64 KiB), alignment as log2
+/// (bits 24-28) and memory type (bits 29-32: write-combined for GPU-only
+/// heaps, cacheable for the CPU-visible ones).
+/// shortcut: the console runtime's own choice of page size and memory type
+/// is not known; this is the plausible one.
+fn resource_attributes(info: AllocationInfo, heap_kind: u32) -> u64 {
+    const GRAPHICS_ALLOCATOR: u64 = 128 << 16;
+    const DEFAULT_HEAP: u32 = 1;
+    let pages: u64 = if info.size >= 2 << 20 { 2 } else { 1 };
+    let memory: u64 = if heap_kind == DEFAULT_HEAP { 1 } else { 3 };
+    let alignment = u64::from(info.alignment.max(1).trailing_zeros());
+    GRAPHICS_ALLOCATOR | pages << 14 | alignment << 24 | memory << 29
 }
 
 impl Memory {
+    /// A committed resource's memory: from the title's allocator if the
+    /// runtime named one, else our own; zeroed either way.
+    fn for_resource(info: AllocationInfo, heap_kind: u32) -> Result<Memory, HRESULT> {
+        let Some(&(alloc, _)) = ALLOCATOR.get() else {
+            return Memory::new(info);
+        };
+        let layout = Layout::from_size_align(info.size as usize, info.alignment as usize)
+            .map_err(|_| E_INVALIDARG)?;
+        let attributes = resource_attributes(info, heap_kind);
+        let ptr =
+            NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
+        // SAFETY: the allocator handed out `size` bytes.
+        unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
+        Ok(Memory {
+            ptr,
+            layout,
+            attributes: Some(attributes),
+        })
+    }
+
     /// `size` zeroed bytes aligned to `alignment` (a power of two).
     pub(crate) fn zeroed(size: u64, alignment: u64) -> Result<Memory, HRESULT> {
         Memory::new(AllocationInfo { size, alignment })
@@ -388,14 +645,21 @@ impl Memory {
             .ok_or(E_INVALIDARG)?;
         // SAFETY: the size is non-zero.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
-        Ok(Memory { ptr, layout })
+        Ok(Memory {
+            ptr,
+            layout,
+            attributes: None,
+        })
     }
 }
 
 impl Drop for Memory {
     fn drop(&mut self) {
-        // SAFETY: allocated in `new` with this layout.
-        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
+        match (self.attributes, ALLOCATOR.get()) {
+            (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
+            // SAFETY: allocated in `new` with this layout.
+            _ => unsafe { dealloc(self.ptr.as_ptr(), self.layout) },
+        }
     }
 }
 
@@ -458,7 +722,12 @@ extern "system" fn heap_desc(this: This, out: *mut HeapDesc) {
 /// to.
 enum Backing {
     Committed(Memory),
-    Placed { heap: This, offset: u64 },
+    Placed {
+        heap: This,
+        offset: u64,
+    },
+    /// Memory the title mapped itself, at this address.
+    Address(*mut u8),
 }
 
 impl Drop for Backing {
@@ -499,6 +768,15 @@ pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u
     (before != wanted).then(|| (host.as_raw(), before))
 }
 
+/// Sets the state the host texture is in after a submission; returns the
+/// one it was in.
+#[cfg(windows)]
+pub(crate) fn swap_host_state(this: This, state: u32) -> u32 {
+    resource(this)
+        .host_state
+        .swap(state, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The host GPU's copy of a title resource, if it has one.
 #[cfg(windows)]
 pub(crate) fn host_resource<'a>(
@@ -528,6 +806,35 @@ fn host_texture(
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
+    // PC refuses depth targets that are also unordered-access (the console
+    // allows both; the title's shadow maps ask for it).
+    // shortcut: the host copy loses UAV use; give it a second view-only
+    // copy if draws write it as a UAV.
+    const DEPTH: u32 = 2;
+    const UNORDERED: u32 = 4;
+    if d.flags & DEPTH != 0 {
+        d.flags &= !UNORDERED;
+    }
+    d.format = pc_format(d.format);
+    const DENY_SHADER_RESOURCE: u32 = 8;
+    if d.flags & DENY_SHADER_RESOURCE == 0
+        && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
+    {
+        d.format = typeless;
+    }
+    // The host has no sRGB unordered access: such textures are typeless,
+    // their unordered access views plain UNORM.
+    if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
+        d.format = family(d.format);
+    }
+    // The clear value names the format too: format, then color or depth
+    // and stencil (5 words).
+    let clear_value = (!clear.is_null()).then(|| {
+        // SAFETY: the title passes a whole clear value.
+        let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
+        value[0] = pc_format(value[0]);
+        value
+    });
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -540,16 +847,32 @@ fn host_texture(
             &heap,
             D3D12_HEAP_FLAG_NONE,
             (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(crate::host::texture_state(state) as i32),
+            D3D12_RESOURCE_STATES(
+                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
+            ),
             // The same layout: format, then color or depth and stencil.
-            (!clear.is_null()).then_some(clear.cast()),
+            clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
             &mut texture,
         )
     };
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }
+    if let Some(t) = &texture {
+        crate::host::name(t, || {
+            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+        });
+    }
     texture
+}
+
+/// A texture's console memory and description; `None` for buffers.
+pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
 /// A buffer's host memory and size; `None` for textures.
@@ -573,6 +896,7 @@ impl Resource {
                     .as_ptr()
                     .add(offset as usize)
             },
+            Backing::Address(at) => at,
         }
     }
 }
@@ -596,6 +920,8 @@ fn hand_out_resource(
 ) -> HRESULT {
     #[cfg(not(windows))]
     let _ = (state, clear);
+    #[cfg(windows)]
+    let host = host_texture(&desc, state, clear);
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -603,11 +929,33 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: host_texture(&desc, state, clear),
+        host_state: host
+            .as_ref()
+            .map_or(0, |t| crate::host::legal_state(t, crate::host::texture_state(state)))
+            .into(),
         #[cfg(windows)]
-        host_state: crate::host::texture_state(state).into(),
+        host,
     });
+    #[cfg(windows)]
+    if desc.dimension == BUFFER {
+        let at = std::ptr::from_ref::<Resource>(&resource) as usize;
+        crate::shadow::register(at, resource.data() as u64, desc.width);
+    }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
+}
+
+#[cfg(windows)]
+impl Drop for Resource {
+    fn drop(&mut self) {
+        crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        if self.desc.dimension == BUFFER {
+            crate::shadow::unregister(
+                std::ptr::from_ref::<Resource>(self) as usize,
+                self.data() as u64,
+            );
+        }
+    }
 }
 
 pub(crate) extern "system" fn create_committed(
@@ -634,7 +982,7 @@ pub(crate) extern "system" fn create_committed(
         heap = heap.kind,
         "committed resource"
     );
-    let memory = match Memory::new(info) {
+    let memory = match Memory::for_resource(info, heap.kind) {
         Ok(memory) => memory,
         Err(hr) => return hr,
     };
@@ -648,6 +996,159 @@ pub(crate) extern "system" fn create_committed(
         iid,
         out,
     )
+}
+
+/// Device method 0x3f8, inferred from the title's calls
+/// (title+0x193e1b4: its back buffers, heap flag "allow display"): the
+/// committed resource creation of the enhanced-barrier interfaces,
+/// `(heap, heap flags, desc1, initial layout, clear value, protected
+/// session, castable format count, castable formats, iid, out)`. The host
+/// copy starts in the common state, as layouts are not tracked.
+#[allow(clippy::too_many_arguments)] // the method's own arguments
+pub(crate) extern "system" fn create_committed3(
+    this: This,
+    heap: *const HeapProperties,
+    heap_flags: u32,
+    desc: *const ResourceDesc,
+    _layout: u32,
+    clear: *const c_void,
+    _protected: This,
+    _castable_count: u32,
+    _castable: *const u32,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    const COMMON: u32 = 0;
+    create_committed(this, heap, heap_flags, desc, COMMON, clear, iid, out)
+}
+
+/// Registered page pools (64 KiB pages the title maps into tiled
+/// resources by page index): first address and page count; a handle is an
+/// index plus one, a removed pool leaves `None`.
+static PAGE_POOLS: std::sync::Mutex<Vec<Option<(u64, u32)>>> = std::sync::Mutex::new(Vec::new());
+
+fn page_pools() -> std::sync::MutexGuard<'static, Vec<Option<(u64, u32)>>> {
+    PAGE_POOLS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Device method 0x250: `(address, page count, handle out)`.
+pub(crate) extern "system" fn register_page_pool(
+    _: This,
+    address: u64,
+    pages: u32,
+    out: *mut usize,
+) -> HRESULT {
+    if out.is_null() || pages == 0 || !address.is_multiple_of(KIB_64) {
+        return E_INVALIDARG;
+    }
+    tracing::debug!(address = format_args!("{address:#x}"), pages, "page pool");
+    let mut pools = page_pools();
+    pools.push(Some((address, pages)));
+    // SAFETY: checked non-null; the title passes room for a handle.
+    unsafe { out.write(pools.len()) };
+    S_OK
+}
+
+/// Device method 0x258.
+pub(crate) extern "system" fn unregister_page_pool(_: This, handle: usize) -> HRESULT {
+    match page_pools().get_mut(handle.wrapping_sub(1)) {
+        Some(pool @ Some(_)) => {
+            *pool = None;
+            S_OK
+        }
+        _ => E_INVALIDARG,
+    }
+}
+
+/// Device method 0x428, one of the `ID3D12Device9` to `ID3D12Device11`
+/// additions. From the title's call: a resource at a virtual
+/// address the title mapped itself, `(address, desc1, initial barrier
+/// layout, clear value, iid, out)`, as `CreatePlacedResourceX` with
+/// enhanced barriers. GPU addresses are CPU addresses, so the resource is
+/// a view of that memory. `D3D12_RESOURCE_DESC1` starts like the plain
+/// description; its sampler feedback region is not needed.
+pub(crate) extern "system" fn create_at_address(
+    _: This,
+    address: u64,
+    desc: *const ResourceDesc,
+    layout: u32,
+    clear: *const c_void,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    // SAFETY: the title passes a description (null is tolerated).
+    let Some(&desc) = (unsafe { desc.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    if address == 0 {
+        return E_INVALIDARG;
+    }
+    tracing::debug!(
+        address = format_args!("{address:#x}"),
+        dimension = desc.dimension,
+        width = desc.width,
+        layout,
+        "resource at an address"
+    );
+    const COMMON: u32 = 0;
+    const DEFAULT: HeapProperties = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 1,
+        visible_nodes: 1,
+    };
+    hand_out_resource(
+        desc,
+        DEFAULT,
+        0,
+        Backing::Address(address as *mut u8),
+        COMMON,
+        clear,
+        iid,
+        out,
+    )
+}
+
+/// Textures the title placed in its own memory and views without a
+/// resource object (device 0x230, the title's streamed and
+/// interface textures), by address and description: a resource at that
+/// address, made the first time a draw reads one.
+/// shortcut: never released (one host texture per distinct address and
+/// description viewed); release them when the title unmaps or reuses the
+/// memory once streaming grows VRAM use.
+#[cfg(windows)]
+static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The resource for a texture placed at `address` with the resource
+/// description `desc` (as words), made on first use.
+#[cfg(windows)]
+pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&r) = map.get(&(address, *desc)) {
+        return Some(r as This);
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if d.dimension == BUFFER {
+        return None;
+    }
+    let mut out = std::ptr::null();
+    let made = create_at_address(
+        std::ptr::null(),
+        address,
+        &d,
+        0,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    if made != S_OK {
+        return None;
+    }
+    map.insert((address, *desc), out as usize);
+    resource(out).host.is_some().then_some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -725,8 +1226,59 @@ extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
         unsafe { out.write(resource(this).desc) };
     }
 }
+/// Device method `GetCustomHeapProperties`, returning its struct through a
+/// hidden first argument: what a standard heap type is as a custom heap.
+/// Memory is unified and cache-coherent (as the architecture query says),
+/// so every type is in pool L0, default heaps are not CPU-visible and the
+/// others are write-back.
+pub(crate) extern "system" fn custom_heap_properties(
+    out: *mut HeapProperties,
+    _: This,
+    nodes: u32,
+    kind: u32,
+) -> *mut HeapProperties {
+    const CUSTOM: u32 = 4;
+    const NOT_AVAILABLE: u32 = 1;
+    const WRITE_BACK: u32 = 3;
+    const L0: u32 = 1;
+    let nodes = nodes.max(1);
+    let cpu_pages = match kind {
+        1 => NOT_AVAILABLE,
+        2 | 3 => WRITE_BACK,
+        _ => 0,
+    };
+    let properties = HeapProperties {
+        kind: CUSTOM,
+        cpu_pages,
+        pool: if cpu_pages == 0 { 0 } else { L0 },
+        creation_nodes: nodes,
+        visible_nodes: nodes,
+    };
+    // SAFETY: the title passes room for the result (null is tolerated).
+    if let Some(out) = unsafe { out.as_mut() } {
+        *out = properties;
+    }
+    out
+}
+
 extern "system" fn gpu_address(this: This) -> u64 {
-    resource(this).data() as u64
+    let r = resource(this);
+    let at = r.data() as u64;
+    // The console's GPU addresses fit in 40 bits; its ray-tracing builder
+    // refuses others (diagnostics: which memory breaks that).
+    #[cfg(feature = "diagnostics")]
+    if at >> 40 != 0 {
+        static ONCE: [std::sync::Once; 2] = [std::sync::Once::new(), std::sync::Once::new()];
+        let backing = match r.backing {
+            Backing::Committed(ref m) => format!("committed, attributes {:?}", m.attributes),
+            Backing::Placed { offset, .. } => format!("placed in a heap at {offset:#x}"),
+            Backing::Address(_) => "at a title address".into(),
+        };
+        ONCE[usize::from(r.desc.dimension == BUFFER)].call_once(|| {
+            tracing::warn!(address = format_args!("{at:#x}"), backing, desc = ?r.desc, "a GPU address above 40 bits")
+        });
+    }
+    at
 }
 extern "system" fn heap_properties(
     this: This,
@@ -747,8 +1299,8 @@ extern "system" fn heap_properties(
 }
 
 /// IUnknown 3, object 4, device child 1, heap 1.
-static HEAP_FUNCTIONS: Table<9> = {
-    let mut f = object::d3d12_object(object::missing_table::<HEAP, 9>());
+static HEAP_FUNCTIONS: Table<24> = {
+    let mut f = object::d3d12_object(object::missing_table::<HEAP, 24>());
     f[0] = heap_query as *const ();
     f[2] = heap_release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
@@ -758,8 +1310,8 @@ static HEAP_FUNCTIONS: Table<9> = {
 
 /// IUnknown 3, object 4, device child 1, resource 10 (7 as on PC, then 3
 /// console ones).
-static RESOURCE_FUNCTIONS: Table<18> = {
-    let mut f = object::d3d12_object(object::missing_table::<RESOURCE, 18>());
+static RESOURCE_FUNCTIONS: Table<32> = {
+    let mut f = object::d3d12_object(object::missing_table::<RESOURCE, 32>());
     f[0] = resource_query as *const ();
     f[2] = resource_release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
@@ -857,14 +1409,113 @@ mod tests {
     }
 
     #[test]
+    fn device_setup_heap_properties_and_resources_at_addresses() {
+        let device = crate::device::device();
+        // GetCustomHeapProperties (0xd0): the struct comes back through the
+        // hidden first argument, which is also returned.
+        type Custom =
+            extern "system" fn(*mut HeapProperties, This, u32, u32) -> *mut HeapProperties;
+        let mut p = PROPERTIES;
+        let back = slot::<Custom>(device, 0xd0)(&mut p, device, 1, 2);
+        assert_eq!(back, &raw mut p);
+        assert_eq!(
+            (
+                p.kind,
+                p.cpu_pages,
+                p.pool,
+                p.creation_nodes,
+                p.visible_nodes
+            ),
+            (4, 3, 1, 1, 1),
+            "upload: custom, write-back, L0"
+        );
+        slot::<Custom>(device, 0xd0)(&mut p, device, 1, 1);
+        assert_eq!(p.cpu_pages, 1, "default: not CPU-visible");
+
+        // 0x428: a buffer over memory the title owns, as the title asks.
+        type At = extern "system" fn(
+            This,
+            u64,
+            *const ResourceDesc,
+            u32,
+            *const c_void,
+            *const Iid,
+            *mut This,
+        ) -> HRESULT;
+        let memory = vec![0u8; 0x1_0000];
+        let address = memory.as_ptr() as u64;
+        let mut r = std::ptr::null();
+        let create = slot::<At>(device, 0x428);
+        let desc = buffer(0x1_0000);
+        let null = std::ptr::null();
+        assert_eq!(
+            create(
+                device,
+                address,
+                &desc,
+                u32::MAX,
+                null,
+                &RESOURCE_IIDS[0],
+                &mut r
+            ),
+            0
+        );
+        assert_eq!(slot::<Address>(r, 0x58)(r), address);
+        assert_eq!(slot::<Release>(r, 0x10)(r), 0);
+        // The title's memory is still there after the release.
+        assert_eq!(memory[0xffff], 0);
+        assert_ne!(
+            create(device, 0, &desc, u32::MAX, null, &RESOURCE_IIDS[0], &mut r),
+            0
+        );
+    }
+
+    #[test]
     fn sizes_cover_every_mip() {
         let size = |d: &ResourceDesc| footprint(d).map(|i| i.size);
         assert_eq!(size(&buffer(256)), Some(KIB_64));
-        // 256x256 RGBA8, full chain: 4/3 of 256 KiB, rounded up.
-        assert_eq!(size(&texture(256, 256, 28, 0)), Some(384 << 10));
+        // Textures take their console layout and its alignment (4 KiB
+        // standard swizzle when the description leaves it to the library):
+        // 512x512 BC7 with 10 mips is 0x56000 bytes, 4 KiB aligned, as on
+        // the console.
+        let layout = |d: &ResourceDesc| texture_layout(d).unwrap().size;
+        let rgba = texture(256, 256, 28, 0);
+        assert_eq!(size(&rgba), Some(layout(&rgba).next_multiple_of(4096)));
+        let bc7 = footprint(&texture(512, 512, 98, 10));
+        let console = AllocationInfo {
+            size: 0x56000,
+            alignment: 0x1000,
+        };
+        assert_eq!(bc7, Some(console));
+        assert!(layout(&rgba) >= 4 * (256 * 256 * 4) / 3, "every mip");
         // BC1 is 8 bytes per 4x4 block: 1024x1024, one mip = 512 KiB.
         assert_eq!(size(&texture(1024, 1024, 71, 1)), Some(512 << 10));
         assert_eq!(size(&texture(16, 16, 66, 1)), None, "1-bit format");
+        // Linear layout (1) and an explicit mode (64 KiB display, 0x10a).
+        let linear = ResourceDesc {
+            layout: 1,
+            ..texture(100, 60, 28, 1)
+        };
+        assert_eq!(
+            texture_layout(&linear).unwrap().planes[0]
+                .layout
+                .desc
+                .swizzle
+                .0,
+            0
+        );
+        let display = ResourceDesc {
+            layout: 0x10a,
+            ..texture(100, 60, 28, 1)
+        };
+        assert_eq!(
+            texture_layout(&display).unwrap().planes[0]
+                .layout
+                .desc
+                .swizzle
+                .0,
+            10
+        );
 
         let mut info = AllocationInfo {
             size: 0,
@@ -875,7 +1526,7 @@ mod tests {
         assert_eq!(
             info,
             AllocationInfo {
-                size: (64 + 384) << 10,
+                size: KIB_64 + size(&descs[1]).unwrap(),
                 alignment: KIB_64
             }
         );

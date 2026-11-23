@@ -33,6 +33,7 @@ macro_rules! host {
         unsafe { std::mem::transmute::<usize, $ty>(address) }
     }};
 }
+pub(crate) use host;
 
 /// Mounted drives: upper-case letter and host root (UTF-16, no trailing
 /// separator, no NUL).
@@ -45,10 +46,7 @@ fn drives() -> MutexGuard<'static, Vec<(u16, Vec<u16>)>> {
 /// Gives the host folder `root` a drive letter (the same one if it already
 /// has one): the highest letter neither the host nor another mount uses.
 pub fn mount(root: &Path) -> Option<char> {
-    let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
-    while wide.len() > 3 && wide.last().is_some_and(|c| SEPARATORS.contains(c)) {
-        wide.pop();
-    }
+    let wide = root_wide(root);
     let mut drives = drives();
     if let Some(&(letter, _)) = drives.iter().find(|(_, r)| *r == wide) {
         return char::from_u32(letter.into());
@@ -63,15 +61,81 @@ pub fn mount(root: &Path) -> Option<char> {
     Some(letter.into())
 }
 
+/// Gives the host folder `root` a drive letter the console fixes (titles
+/// open their package as `G:\..` and temporary files as `T:\..`). A host
+/// drive of that letter is hidden from the title.
+pub fn mount_at(letter: char, root: &Path) {
+    let letter = letter.to_ascii_uppercase();
+    let Some(index) = u32::from(letter)
+        .checked_sub(u32::from('A'))
+        .filter(|i| *i < 26)
+    else {
+        return;
+    };
+    // SAFETY: no arguments.
+    let hides_host_drive = unsafe { GetLogicalDrives() } >> index & 1 != 0;
+    tracing::info!(drive = %letter, root = %root.display(), hides_host_drive, "virtual drive");
+    let mut drives = drives();
+    drives.retain(|(l, _)| u32::from(*l) != u32::from(letter));
+    drives.push((letter as u16, root_wide(root)));
+}
+
+/// `root` as UTF-16, absolute, without trailing separators (a drive root
+/// keeps its own).
+fn root_wide(root: &Path) -> Vec<u16> {
+    let root = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
+    let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
+    while wide.len() > 3 && wide.last().is_some_and(|c| SEPARATORS.contains(c)) {
+        wide.pop();
+    }
+    wide
+}
+
 const SEPARATORS: [u16; 2] = [b'\\' as u16, b'/' as u16];
 const VERBATIM: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
 
+/// Host paths from this length on take the `\\?\` form, which lifts the
+/// host's MAX_PATH limit (248 characters for a directory, 260 for a file).
+const LONG: usize = 248;
+
+/// `root` and the title's `tail` as a `\\?\` path. That form turns off the
+/// host's own clean-up, so `/` becomes `\` and `.` and `..` are resolved
+/// here (`..` stops at the root).
+fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
+    let backslash = u16::from(b'\\');
+    let mut out = if root.starts_with(&VERBATIM) {
+        root.to_vec()
+    } else if let Some(unc) = root.strip_prefix(&[backslash; 2][..]) {
+        let mut out = VERBATIM.to_vec();
+        out.extend("UNC\\".encode_utf16());
+        out.extend_from_slice(unc);
+        out
+    } else {
+        [&VERBATIM[..], root].concat()
+    };
+    while out.last() == Some(&backslash) {
+        out.pop();
+    }
+    let dot = u16::from(b'.');
+    let mut parts: Vec<&[u16]> = Vec::new();
+    for part in tail.split(|c| SEPARATORS.contains(c)) {
+        match part {
+            [] => {}
+            [d] if *d == dot => {}
+            [d, e] if [*d, *e] == [dot; 2] => drop(parts.pop()),
+            _ => parts.push(part),
+        }
+    }
+    for part in parts {
+        out.push(backslash);
+        out.extend_from_slice(part);
+    }
+    out
+}
+
 /// The host path, NUL-terminated, for `path` (without its NUL) if it is on
 /// a virtual drive.
-// shortcut: host roots are not made verbatim, so a long host root can push a
-// title path past MAX_PATH; switch to `\\?\` paths (normalising `..` and `/`
-// ourselves) if a title's paths get that long.
-fn translate(path: &[u16]) -> Option<Vec<u16>> {
+pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     let (prefix, rest) = match path.strip_prefix(&VERBATIM[..]) {
         Some(rest) => (&VERBATIM[..], rest),
         None => (&[][..], path),
@@ -87,6 +151,11 @@ fn translate(path: &[u16]) -> Option<Vec<u16>> {
     let drives = drives();
     let (_, root) = drives.iter().find(|(l, _)| *l == letter)?;
     let tail = &rest[2..];
+    if prefix.is_empty() && root.len() + tail.len() >= LONG {
+        let mut out = verbatim(root, tail);
+        out.push(0);
+        return Some(out);
+    }
     let mut out = prefix.to_vec();
     out.extend_from_slice(root);
     // `X:` and `X:name` are relative to the root.
@@ -124,7 +193,18 @@ fn wide(path: *const u16) -> Wide {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         std::slice::from_raw_parts(path, len)
     };
-    Wide(path, translate(path_slice))
+    let host = translate(path_slice);
+    trace(path_slice, host.as_deref());
+    Wide(path, host)
+}
+
+/// Every title path at debug level, with the host path if rewritten.
+fn trace(path: &[u16], host: Option<&[u16]>) {
+    tracing::debug!(
+        path = %String::from_utf16_lossy(path),
+        host = host.map(|h| String::from_utf16_lossy(&h[..h.len() - 1])),
+        "title path"
+    );
 }
 
 /// A narrow path (ANSI code page, as the host decodes it) on a virtual
@@ -138,7 +218,10 @@ fn narrow(path: *const c_char) -> Option<Vec<u16>> {
     // The drive part is ASCII in every code page; decode only candidates.
     match bytes.strip_prefix(br"\\?\").unwrap_or(bytes) {
         [letter, b':', ..] if letter.is_ascii_alphabetic() => {}
-        _ => return None,
+        _ => {
+            tracing::debug!(path = %String::from_utf8_lossy(bytes), "title path");
+            return None;
+        }
     }
     let len = i32::try_from(bytes.len()).ok()?;
     // SAFETY: sizing call, then a call with room for `n` units.
@@ -148,7 +231,9 @@ fn narrow(path: *const c_char) -> Option<Vec<u16>> {
         MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n);
         wide
     };
-    translate(&wide)
+    let host = translate(&wide);
+    trace(&wide, host.as_deref());
+    host
 }
 
 /// An ASCII mode string (`"rb"`, `"w, ccs=UTF-8"`) for a wide CRT call.
@@ -220,6 +305,24 @@ pub extern "system" fn CreateFileA(
     }
 }
 
+/// Used by Bink.
+pub extern "system" fn CreateFile2(
+    path: *const u16,
+    access: u32,
+    share: u32,
+    disposition: u32,
+    params: *const c_void,
+) -> Handle {
+    let p = wide(path);
+    host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
+        p.ptr(),
+        access,
+        share,
+        disposition,
+        params,
+    )
+}
+
 pub extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
     match narrow(path) {
         Some(p) => {
@@ -227,6 +330,35 @@ pub extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
         }
         None => {
             host!("kernel32.dll", "DeleteFileA": extern "system" fn(*const c_char) -> i32)(path)
+        }
+    }
+}
+
+pub extern "system" fn DeleteFileW(path: *const u16) -> i32 {
+    let p = wide(path);
+    host!("kernel32.dll", "DeleteFileW": extern "system" fn(*const u16) -> i32)(p.ptr())
+}
+
+pub extern "system" fn RemoveDirectoryW(path: *const u16) -> i32 {
+    let p = wide(path);
+    host!("kernel32.dll", "RemoveDirectoryW": extern "system" fn(*const u16) -> i32)(p.ptr())
+}
+
+pub extern "system" fn SetFileAttributesW(path: *const u16, attributes: u32) -> i32 {
+    let p = wide(path);
+    host!("kernel32.dll", "SetFileAttributesW": extern "system" fn(*const u16, u32) -> i32)(
+        p.ptr(),
+        attributes,
+    )
+}
+
+pub extern "system" fn GetFileAttributesA(path: *const c_char) -> u32 {
+    match narrow(path) {
+        Some(p) => GetFileAttributesW(p.as_ptr()),
+        None => {
+            host!("kernel32.dll", "GetFileAttributesA": extern "system" fn(*const c_char) -> u32)(
+                path,
+            )
         }
     }
 }
@@ -250,6 +382,11 @@ pub extern "system" fn GetFileAttributesExW(
         level,
         info,
     )
+}
+
+pub extern "system" fn GetFileAttributesW(path: *const u16) -> u32 {
+    let p = wide(path);
+    host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(p.ptr())
 }
 
 pub extern "system" fn GetDiskFreeSpaceExW(
@@ -369,6 +506,34 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
     )
 }
 
+// Kernel reads into title memory. The GPU side leaves blocks of title GPU
+// buffers read-only to see the title's next write, and the kernel's writes
+// fail there instead of faulting into its handler; the title's
+// synchronous reads (title+0x313fc0) read straight into 4 KiB-aligned
+// destinations and retry a failed `ReadFile` forever. So the destination
+// is opened first.
+
+pub extern "system" fn ReadFile(
+    file: *mut c_void,
+    buffer: *mut u8,
+    len: u32,
+    read: *mut u32,
+    overlapped: *mut c_void,
+) -> i32 {
+    victory_gpu::kernel_will_write(buffer as usize, len as usize);
+    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+        file, buffer, len, read, overlapped,
+    )
+}
+
+/// The host CRT reads large requests straight into the caller's buffer.
+pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
+    victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
+    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
+        buffer, size, count, stream,
+    )
+}
+
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
     match narrow(path) {
         Some(p) => _wfopen(p.as_ptr(), widen(mode).as_ptr()),
@@ -389,6 +554,31 @@ pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_ch
             )
         }
     }
+}
+
+/// `_open(path, flags[, mode])` is variadic; on x64 the optional integer
+/// travels in the same register either way, so it is passed on as is.
+pub extern "C" fn _open(path: *const c_char, flags: i32, mode: i32) -> i32 {
+    match narrow(path) {
+        Some(p) => host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
+            p.as_ptr(),
+            flags,
+            mode,
+        ),
+        None => host!("ucrtbase.dll", "_open": extern "C" fn(*const c_char, i32, i32) -> i32)(
+            path, flags, mode,
+        ),
+    }
+}
+
+/// See [`_open`]; used by libHttpClient.
+pub extern "C" fn _wopen(path: *const u16, flags: i32, mode: i32) -> i32 {
+    let p = wide(path);
+    host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
+        p.ptr(),
+        flags,
+        mode,
+    )
 }
 
 pub extern "C" fn _wstat64(path: *const u16, stat: *mut c_void) -> i32 {
@@ -435,17 +625,22 @@ pub extern "C" fn _wutime64(path: *const u16, times: *mut c_void) -> i32 {
 // The C++ library: `std::basic_filebuf::open` goes through `_Fiopen`.
 
 const FIOPEN: &str = "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z";
+const FIOPEN_WIDE: &str = "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z";
+
+/// `_Fiopen(const wchar_t* path, ios_base::openmode, int protection)`.
+extern "C" fn fiopen_wide(path: *const u16, mode: i32, protection: i32) -> File {
+    let p = wide(path);
+    host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
+        p.ptr(),
+        mode,
+        protection,
+    )
+}
 
 /// `_Fiopen(const char* path, ios_base::openmode, int protection)`.
 extern "C" fn fiopen(path: *const c_char, mode: i32, protection: i32) -> File {
     match narrow(path) {
-        Some(p) => {
-            host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
-                p.as_ptr(),
-                mode,
-                protection,
-            )
-        }
+        Some(p) => fiopen_wide(p.as_ptr(), mode, protection),
         None => {
             host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z": extern "C" fn(*const c_char, i32, i32) -> File)(
                 path, mode, protection,
@@ -469,10 +664,18 @@ pub(crate) fn module() -> HleModule {
             "msvcp140.dll",
         ],
         exports: vec![
+            hle_export!(ReadFile),
+            hle_export!(fread),
             hle_export!(CreateFileW),
             hle_export!(CreateFileA),
+            hle_export!(CreateFile2),
             hle_export!(DeleteFileA),
+            hle_export!(DeleteFileW),
+            hle_export!(RemoveDirectoryW),
+            hle_export!(SetFileAttributesW),
+            hle_export!(GetFileAttributesA),
             hle_export!(CreateDirectoryW),
+            hle_export!(GetFileAttributesW),
             hle_export!(GetFileAttributesExW),
             hle_export!(GetDiskFreeSpaceExW),
             hle_export!(GetDiskFreeSpaceW),
@@ -485,6 +688,8 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_wfsopen),
             hle_export!(fopen),
             hle_export!(fopen_s),
+            hle_export!(_open),
+            hle_export!(_wopen),
             hle_export!(_wstat64),
             hle_export!(_stat64i32),
             hle_export!(remove),
@@ -493,6 +698,10 @@ pub(crate) fn module() -> HleModule {
             HleExport {
                 name: FIOPEN,
                 address: fiopen as *const () as usize,
+            },
+            HleExport {
+                name: FIOPEN_WIDE,
+                address: fiopen_wide as *const () as usize,
             },
         ],
     }
@@ -504,6 +713,19 @@ mod tests {
 
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().chain([0]).collect()
+    }
+
+    #[test]
+    fn kernel_reads_reach_the_buffer() {
+        use std::os::windows::io::AsRawHandle;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let (mut out, mut n) = ([0u8; 10], 0);
+        let handle = file.as_raw_handle().cast();
+        assert_ne!(ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()), 0);
+        assert_eq!((&out, n), (b"0123456789", 10));
     }
 
     fn text(v: &[u16]) -> String {
@@ -535,6 +757,45 @@ mod tests {
         assert_eq!(tr(r"C:\Windows".into()), None);
         assert_eq!(tr("relative/path".into()), None);
         assert_eq!(tr(String::new()), None);
+
+        // Fixed letters, as the console's package drive; a later mount of
+        // the same letter replaces the earlier one.
+        let package = tempfile::tempdir().unwrap();
+        mount_at('g', dir.path());
+        mount_at('G', package.path());
+        assert_eq!(
+            tr(r"G:\appdata0.rpf".into()),
+            Some(format!(r"{}\appdata0.rpf", package.path().display()))
+        );
+        assert_ne!(mount(dir.path()), Some('G'), "free letters skip fixed ones");
+
+        // Long ones take the `\\?\` form, cleaned up as the host would.
+        let long = "d".repeat(250);
+        assert_eq!(
+            tr(format!(r"G:/a/./b/../{long}//f")),
+            Some(format!(r"\\?\{}\a\{long}\f", package.path().display()))
+        );
+        assert_eq!(
+            verbatim(&w(r"\\server\share\")[..15], &w("/x/../../y")[..10]),
+            w(r"\\?\UNC\server\share\y")[..22].to_vec()
+        );
+    }
+
+    #[test]
+    fn long_title_paths_work_on_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let letter = mount(dir.path()).unwrap();
+        let deep = format!("{letter}:/{}/{}", "a".repeat(200), "b".repeat(100));
+        let null = std::ptr::null_mut();
+        let first = w(&deep[..203]);
+        assert_ne!(CreateDirectoryW(first.as_ptr(), null), 0);
+        assert_ne!(CreateDirectoryW(w(&deep).as_ptr(), null), 0);
+        let file = format!("{deep}/../{}/f.txt", "b".repeat(100));
+        let f = _wfopen(w(&file).as_ptr(), w("wb").as_ptr());
+        assert!(!f.is_null(), "{file}");
+        host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)(f);
+        assert_ne!(DeleteFileW(w(&format!("{deep}/f.txt")).as_ptr()), 0);
+        assert_ne!(RemoveDirectoryW(w(&deep).as_ptr()), 0);
     }
 
     #[test]
@@ -576,6 +837,27 @@ mod tests {
 
         assert_eq!(remove(path.as_ptr().cast()), 0);
         assert!(!dir.path().join("stream.txt").exists());
+        let f = fiopen_wide(w(&format!("{letter}:/wide.txt")).as_ptr(), OUT, 0x40);
+        assert!(!f.is_null());
+        fclose(f);
+        assert!(dir.path().join("wide.txt").is_file());
+
+        const OPEN_EXISTING: u32 = 3;
+        let path = w(&format!(r"{letter}:\created.bin"));
+        let h = CreateFile2(path.as_ptr(), GENERIC_WRITE, 0, OPEN_EXISTING, null);
+        assert_ne!(h as isize, -1);
+        close(h);
+        const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+        assert_ne!(GetFileAttributesW(path.as_ptr()), INVALID_FILE_ATTRIBUTES);
+
+        const O_WRONLY: i32 = 1;
+        const O_CREAT: i32 = 0x100;
+        const S_IWRITE: i32 = 0x80;
+        let path = format!("{letter}:/low.bin\0");
+        let fd = _open(path.as_ptr().cast(), O_WRONLY | O_CREAT, S_IWRITE);
+        assert!(fd >= 0);
+        host!("ucrtbase.dll", "_close": extern "C" fn(i32) -> i32)(fd);
+        assert!(dir.path().join("low.bin").is_file());
 
         // Other paths pass through untouched.
         let host_path = format!("{}\0", dir.path().join("plain.txt").display());

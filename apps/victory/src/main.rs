@@ -69,7 +69,22 @@ enum Command {
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
-    Translate { paths: Vec<PathBuf> },
+    Translate {
+        paths: Vec<PathBuf>,
+        /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
+        /// else the newest Windows SDK's).
+        #[arg(long)]
+        validate: bool,
+        /// Also create a host D3D12 pipeline for each emitted shader.
+        #[arg(long)]
+        pipelines: bool,
+        /// Print one line per program and outcome.
+        #[arg(long)]
+        list: bool,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -82,6 +97,13 @@ enum Command {
         /// Actually start the title. Without it, stop after binding.
         #[arg(long)]
         execute: bool,
+        /// The console model the title sees (device type, memory).
+        #[arg(long, value_enum, default_value_t = Console::SeriesX)]
+        console: Console,
+        /// Arguments for the title, after `--` (it reads the whole command
+        /// line; a title that relaunches itself passes some).
+        #[arg(last = true)]
+        title_args: Vec<String>,
     },
     /// Show the resolved configuration and check it.
     Config,
@@ -93,8 +115,19 @@ enum Unimplemented {
     Zero,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum Console {
+    SeriesX,
+    SeriesS,
+}
+
 fn main() -> Result<()> {
     victory_core::logging::init("info");
+    // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if victory_hle::modules::audio::capture::child() {
+        return Ok(());
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Inspect {
@@ -113,13 +146,21 @@ fn main() -> Result<()> {
             verbose,
             disasm,
         } => shader::run(paths, verbose || disasm, disasm),
-        Command::Translate { paths } => translate::run(paths),
+        Command::Translate {
+            paths,
+            validate,
+            pipelines,
+            list,
+            jobs,
+        } => translate::run(paths, validate, pipelines, list, jobs),
         Command::Run {
             exe,
             unimplemented,
             strict,
             execute,
-        } => run::run(&exe, unimplemented, strict, execute),
+            console,
+            title_args: _,
+        } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
     }
 }

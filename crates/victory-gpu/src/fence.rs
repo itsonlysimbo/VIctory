@@ -24,7 +24,10 @@ pub(crate) const FENCE_IIDS: [Iid; 4] = [
 #[repr(C)]
 struct Fence {
     object: Object,
+    /// Titles also read it straight from memory, at the fence's GPU
+    /// address.
     value: AtomicU64,
+    flags: u32,
     /// Events to set once the value reaches theirs (handles as integers).
     waiters: Mutex<Vec<(u64, usize)>>,
 }
@@ -45,6 +48,7 @@ pub(crate) extern "system" fn create(
     let fence = Box::new(Fence {
         object: Object::new(&FUNCTIONS),
         value: AtomicU64::new(initial),
+        flags,
         waiters: Mutex::new(Vec::new()),
     });
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
@@ -106,15 +110,26 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     S_OK
 }
 
-/// IUnknown 3, object 4, device child 1, fence 3.
-static FUNCTIONS: Table<11> = {
-    let mut f = object::d3d12_object(object::missing_table::<FENCE, 11>());
+extern "system" fn creation_flags(this: This) -> u32 {
+    fence(this).flags
+}
+/// Where the value lives (GPU addresses are CPU addresses).
+extern "system" fn gpu_address(this: This) -> u64 {
+    (&raw const fence(this).value) as u64
+}
+
+/// IUnknown 3, object 4, device child 1, fence 3, fence 1 (2, a console
+/// one among them).
+static FUNCTIONS: Table<24> = {
+    let mut f = object::d3d12_object(object::missing_table::<FENCE, 24>());
     f[0] = query as *const ();
     f[2] = release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
     f[8] = completed as *const (); // 0x40
     f[9] = set_event_on_completion as *const (); // 0x48
     f[10] = signal as *const (); // 0x50
+    f[11] = creation_flags as *const (); // 0x58
+    f[12] = gpu_address as *const (); // 0x60
     Table(f)
 };
 
@@ -147,6 +162,10 @@ mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
         assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
+        // the title reads the value at the fence's address.
+        let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
+        // SAFETY: the fence's value.
+        assert_eq!(unsafe { *(at as *const u64) }, 5);
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);

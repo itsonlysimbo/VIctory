@@ -4,11 +4,11 @@
 //! input device is associated with the user (there are none, `gameinput`).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 
 use super::xasync::{self, AsyncBlock, ProviderData};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, token,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
 };
 
 /// The user provider.
@@ -81,6 +81,9 @@ pub static DEVICE_OBJECT: Object = Object::new("user devices", &DEVICE_VTABLE);
 
 pub const INTERFACES: &[Interface] = &[
     (PROVIDER, IID, &OBJECT),
+    // the title (2026) asks with the provider's id; its thunks call
+    // the same slots with the same arguments (0x108/0x110 change events).
+    (PROVIDER, PROVIDER, &OBJECT),
     (PROVIDER, GAMERTAG_IID, &GAMERTAG_OBJECT),
     (DEVICE_PROVIDER, DEVICE_IID, &DEVICE_OBJECT),
 ];
@@ -178,6 +181,65 @@ extern "system" fn check_privilege(
     put(has, true)
 }
 
+/// 3: adult.
+extern "system" fn get_age_group(_: This, _: Handle, out: *mut u32) -> HRESULT {
+    put(out, 3)
+}
+
+static RESOLVE: u8 = 0;
+static TOKEN: u8 = 0;
+
+/// Every privilege is granted, so there is nothing to resolve.
+extern "system" fn resolve_privilege_async(
+    _: This,
+    _: Handle,
+    _options: u32,
+    _privilege: u32,
+    block: *mut AsyncBlock,
+) -> HRESULT {
+    xasync::finished(block, (&raw const RESOLVE).cast(), S_OK)
+}
+extern "system" fn resolve_privilege_result(_: This, block: *mut AsyncBlock) -> HRESULT {
+    let none = std::ptr::null_mut();
+    xasync::XAsyncGetResult(block, (&raw const RESOLVE).cast(), 0, none, none.cast())
+}
+
+/// The documented "failed to get token": tokens come from the service.
+pub const FAILED_TO_GET_TOKEN: HRESULT = 0x8924_5111_u32 as i32;
+
+#[allow(clippy::too_many_arguments)]
+extern "system" fn token_async(
+    _: This,
+    _: Handle,
+    _options: u32,
+    _method: *const c_char,
+    url: *const c_char,
+    _header_count: usize,
+    _headers: *const c_void,
+    _body_size: usize,
+    _body: *const c_void,
+    block: *mut AsyncBlock,
+) -> HRESULT {
+    tracing::info!(
+        url = text(url).unwrap_or_default(),
+        "token and signature: offline"
+    );
+    xasync::finished(block, (&raw const TOKEN).cast(), FAILED_TO_GET_TOKEN)
+}
+extern "system" fn token_size(_: This, block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
+    xasync::XAsyncGetResultSize(block, out)
+}
+extern "system" fn token_result(
+    _: This,
+    block: *mut AsyncBlock,
+    size: usize,
+    buffer: *mut c_void,
+    _data: *mut *const c_void,
+    used: *mut usize,
+) -> HRESULT {
+    xasync::XAsyncGetResult(block, (&raw const TOKEN).cast(), size, buffer, used)
+}
+
 /// The user never changes and no device is ever associated, so these
 /// callbacks are never called.
 extern "system" fn register(
@@ -198,43 +260,44 @@ extern "system" fn find_for_device(_: This, _device: *const c_void, _: *mut Hand
     USER_NOT_FOUND
 }
 
-// Unset slots: gamer pictures, token and signature, issue resolution.
+// Unset slots (no title seen calls them): maximum users, gamer pictures,
+// the UTF-16 token calls, issue resolution.
 static VTABLE: Methods<35> = Methods([
-    missing::<0> as *const (),     // 0x00 QueryInterface
-    add_ref as *const (),          // 0x08 AddRef
-    add_ref as *const (),          // 0x10 Release: the object is static
-    duplicate as *const (),        // 0x18
-    close as *const (),            // 0x20
-    compare as *const (),          // 0x28
-    missing::<6> as *const (),     // 0x30 maximum users
-    add_async as *const (),        // 0x38
-    add_result as *const (),       // 0x40
-    get_local_id as *const (),     // 0x48
-    find_by_local_id as *const (), // 0x50
-    get_id as *const (),           // 0x58
-    find_by_id as *const (),       // 0x60
-    get_is_guest as *const (),     // 0x68
-    get_state as *const (),        // 0x70
-    get_gamertag as *const (),     // 0x78 older gamertag slot
-    missing::<16> as *const (),    // 0x80 gamer picture: begin
-    missing::<17> as *const (),    // 0x88 result size
-    missing::<18> as *const (),    // 0x90 result
-    missing::<19> as *const (),    // 0x98 age group
-    check_privilege as *const (),  // 0xa0
-    missing::<21> as *const (),    // 0xa8 resolve privilege with UI: begin
-    missing::<22> as *const (),    // 0xb0 result
-    missing::<23> as *const (),    // 0xb8 token and signature: begin
-    missing::<24> as *const (),    // 0xc0 result size
-    missing::<25> as *const (),    // 0xc8 result
-    missing::<26> as *const (),    // 0xd0 the same, UTF-16: begin
-    missing::<27> as *const (),    // 0xd8 result size
-    missing::<28> as *const (),    // 0xe0 result
-    missing::<29> as *const (),    // 0xe8 resolve issue with UI: begin
-    missing::<30> as *const (),    // 0xf0 result
-    missing::<31> as *const (),    // 0xf8 the same, UTF-16: begin
-    missing::<32> as *const (),    // 0x100 result
-    register as *const (),         // 0x108 change event
-    unregister as *const (),       // 0x110
+    missing::<0> as *const (),             // 0x00 QueryInterface
+    add_ref as *const (),                  // 0x08 AddRef
+    add_ref as *const (),                  // 0x10 Release: the object is static
+    duplicate as *const (),                // 0x18
+    close as *const (),                    // 0x20
+    compare as *const (),                  // 0x28
+    missing::<6> as *const (),             // 0x30 maximum users
+    add_async as *const (),                // 0x38
+    add_result as *const (),               // 0x40
+    get_local_id as *const (),             // 0x48
+    find_by_local_id as *const (),         // 0x50
+    get_id as *const (),                   // 0x58
+    find_by_id as *const (),               // 0x60
+    get_is_guest as *const (),             // 0x68
+    get_state as *const (),                // 0x70
+    get_gamertag as *const (),             // 0x78 older gamertag slot
+    missing::<16> as *const (),            // 0x80 gamer picture: begin
+    missing::<17> as *const (),            // 0x88 result size
+    missing::<18> as *const (),            // 0x90 result
+    get_age_group as *const (),            // 0x98
+    check_privilege as *const (),          // 0xa0
+    resolve_privilege_async as *const (),  // 0xa8 with UI
+    resolve_privilege_result as *const (), // 0xb0
+    token_async as *const (),              // 0xb8 token and signature
+    token_size as *const (),               // 0xc0
+    token_result as *const (),             // 0xc8
+    missing::<26> as *const (),            // 0xd0 the same, UTF-16: begin
+    missing::<27> as *const (),            // 0xd8 result size
+    missing::<28> as *const (),            // 0xe0 result
+    missing::<29> as *const (),            // 0xe8 resolve issue with UI: begin
+    missing::<30> as *const (),            // 0xf0 result
+    missing::<31> as *const (),            // 0xf8 the same, UTF-16: begin
+    missing::<32> as *const (),            // 0x100 result
+    register as *const (),                 // 0x108 change event
+    unregister as *const (),               // 0x110
 ]);
 
 static GAMERTAG_VTABLE: Methods<4> = Methods([
@@ -293,6 +356,44 @@ mod tests {
         assert_eq!(
             get(this, handle, 0, 2, name.as_mut_ptr(), &mut used),
             E_NOT_SUFFICIENT_BUFFER
+        );
+
+        type Age = extern "system" fn(This, Handle, *mut u32) -> HRESULT;
+        let mut age = 0;
+        assert_eq!(slot::<Age>(&OBJECT, 0x98)(this, handle, &mut age), S_OK);
+        assert_eq!(age, 3, "adult");
+        type Token = extern "system" fn(
+            This,
+            Handle,
+            u32,
+            *const c_char,
+            *const c_char,
+            usize,
+            *const c_void,
+            usize,
+            *const c_void,
+            *mut AsyncBlock,
+        ) -> HRESULT;
+        let (null, url) = (std::ptr::null(), c"https://example.invalid/");
+        let token = slot::<Token>(&OBJECT, 0xb8);
+        assert_eq!(
+            token(
+                this,
+                handle,
+                0,
+                c"GET".as_ptr(),
+                url.as_ptr(),
+                0,
+                null,
+                0,
+                null,
+                &mut block
+            ),
+            S_OK
+        );
+        assert_eq!(
+            xasync::XAsyncGetStatus(&mut block, true),
+            FAILED_TO_GET_TOKEN
         );
     }
 }

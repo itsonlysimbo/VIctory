@@ -26,8 +26,17 @@ pub const IID: Guid = Guid::new(
     [0x8b, 0x27, 0x95, 0xfc, 0x02, 0xd0, 0xf7, 0x5d],
 );
 
+/// As the title (2026) asks for it; it calls 0x20 (path) and 0x28
+/// (space) with the same arguments.
+pub const IID_2026: Guid = Guid::new(
+    0x41a4_e10c,
+    0x5a7e,
+    0x41d9,
+    [0x8c, 0x37, 0x37, 0xbd, 0xe6, 0x2a, 0x07, 0xd6],
+);
+
 pub static OBJECT: Object = Object::new("persistent local storage", &VTABLE);
-pub const INTERFACES: &[Interface] = &[(PROVIDER, IID, &OBJECT)];
+pub const INTERFACES: &[Interface] = &[(PROVIDER, IID, &OBJECT), (PROVIDER, IID_2026, &OBJECT)];
 
 type This = *const Object;
 
@@ -87,14 +96,38 @@ fn used_bytes(dir: &Path) -> u64 {
         .sum()
 }
 
+/// What the host disk under `dir` has free (unlimited if unknown).
+pub(crate) fn disk_free(dir: &Path) -> u64 {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+        let mut free = 0;
+        let null = std::ptr::null_mut();
+        // SAFETY: a NUL-terminated path and a valid output.
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free,
+                null,
+                null,
+            )
+        };
+        if ok != 0 {
+            return free;
+        }
+    }
+    let _ = dir;
+    u64::MAX
+}
+
 fn space() -> SpaceInfo {
     let title = runtime::title();
     let used = used_bytes(&title.storage);
     let free = title.storage_bytes.saturating_sub(used);
-    // shortcut: the host disk's free space is not checked; do so if a title
-    // fills its quota on a nearly full disk.
     SpaceInfo {
-        available_free: free,
+        // Writable now: the quota's rest, as far as the host disk allows.
+        available_free: free.min(disk_free(&title.storage)),
         total_free: free,
         used,
         total: title.storage_bytes,
@@ -153,6 +186,7 @@ mod tests {
             id: 1,
             storage: dir.path().to_owned(),
             storage_bytes: 1000,
+            ..Default::default()
         });
 
         // The path is a drive root, never the host folder.

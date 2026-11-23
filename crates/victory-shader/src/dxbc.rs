@@ -22,6 +22,8 @@ impl FourCC {
     pub const PSV0: FourCC = FourCC(*b"PSV0");
     pub const ISG1: FourCC = FourCC(*b"ISG1");
     pub const OSG1: FourCC = FourCC(*b"OSG1");
+    /// Per-primitive outputs of a mesh shader.
+    pub const PSG1: FourCC = FourCC(*b"PSG1");
     pub const SFI0: FourCC = FourCC(*b"SFI0");
     pub const HASH: FourCC = FourCC(*b"HASH");
     pub const ILDB: FourCC = FourCC(*b"ILDB");

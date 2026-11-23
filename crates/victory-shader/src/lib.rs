@@ -8,14 +8,19 @@
 
 pub mod dxbc;
 pub mod dxil;
+pub mod emit;
 pub mod gfx10;
+pub mod io;
 pub mod ir;
 pub mod native;
+pub mod resource;
 pub mod structure;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
-pub use native::{HwStage, NativeProgram, native_programs};
+pub use native::{
+    HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,
+};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {

@@ -14,7 +14,10 @@ use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
 use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
 
 use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
-use crate::{DLL_PROCESS_ATTACH, ImportResolver, PreparedImage, Provenance, Resolution, prepare};
+use crate::{
+    DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, ImportResolver, PreparedImage, Provenance, Resolution,
+    prepare,
+};
 
 /// A title image mapped into this process. A clone names the same mapping
 /// (no reference of its own): unload one copy only.
@@ -308,13 +311,20 @@ impl LoadedImage {
     /// # Safety
     /// Runs title code. Imports must be bound first.
     pub unsafe fn run_tls_callbacks(&self, reason: u32) {
+        // SAFETY: forwarded from the caller.
+        unsafe { self.tls_callbacks(reason, std::ptr::null_mut()) }
+    }
+
+    /// # Safety
+    /// See [`Self::run_tls_callbacks`].
+    unsafe fn tls_callbacks(&self, reason: u32, reserved: *mut c_void) {
         let Some(tls) = &self.info.tls else { return };
         for &rva in &tls.callback_rvas {
             type TlsCallback = unsafe extern "system" fn(*mut c_void, u32, *mut c_void);
             // SAFETY: the RVA came from the image's own TLS directory.
             let callback: TlsCallback = unsafe { std::mem::transmute(self.base() + rva as usize) };
             // SAFETY: the caller guarantees imports are bound.
-            unsafe { callback(self.module, reason, std::ptr::null_mut()) };
+            unsafe { callback(self.module, reason, reserved) };
         }
     }
 
@@ -327,22 +337,39 @@ impl LoadedImage {
     /// depends on attached.
     pub unsafe fn attach(&self) -> Result<()> {
         // SAFETY: forwarded from the caller.
-        if unsafe { self.notify(DLL_PROCESS_ATTACH, true) } == Some(0) {
+        if unsafe { self.notify(DLL_PROCESS_ATTACH, true, std::ptr::null_mut()) } == Some(0) {
             bail!("DllMain returned FALSE");
         }
         crate::threads::attached(self.base());
         Ok(())
     }
 
+    /// `DLL_PROCESS_DETACH` as `FreeLibrary` sends it (TLS callbacks, then
+    /// `DllMain`); the image hears of no more threads.
+    ///
+    /// # Safety
+    /// Runs title code. The image must have been attached (or its attach
+    /// failed), and no other thread may be using it.
+    pub unsafe fn detach(&self) {
+        crate::threads::detached(self.base());
+        // SAFETY: forwarded from the caller.
+        unsafe { self.notify(DLL_PROCESS_DETACH, true, std::ptr::null_mut()) };
+    }
+
     /// Runs the image's TLS callbacks with `reason`, then, if `dll_main` and
     /// the image is a DLL with an entry point, its `DllMain`, whose result
-    /// is returned.
+    /// is returned. `reserved` is the entry points' third argument.
     ///
     /// # Safety
     /// Runs title code. Imports must be bound first.
-    pub(crate) unsafe fn notify(&self, reason: u32, dll_main: bool) -> Option<i32> {
+    pub(crate) unsafe fn notify(
+        &self,
+        reason: u32,
+        dll_main: bool,
+        reserved: *mut c_void,
+    ) -> Option<i32> {
         // SAFETY: forwarded from the caller.
-        unsafe { self.run_tls_callbacks(reason) };
+        unsafe { self.tls_callbacks(reason, reserved) };
         if !dll_main || !self.info.is_dll() || self.info.entry_rva == 0 {
             return None;
         }
@@ -351,7 +378,7 @@ impl LoadedImage {
         let main: DllMain =
             unsafe { std::mem::transmute(self.base() + self.info.entry_rva as usize) };
         // SAFETY: forwarded from the caller.
-        Some(unsafe { main(self.module, reason, std::ptr::null_mut()) })
+        Some(unsafe { main(self.module, reason, reserved) })
     }
 
     /// Starts the title: on a new thread with the stack size from the image

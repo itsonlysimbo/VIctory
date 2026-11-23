@@ -27,12 +27,12 @@ impl Default for HostPolicy {
             "ucrtbase.dll",
             "vcruntime140*",
             "msvcp140*",
+            // Off-machine traffic is refused in `modules::net`.
             "ws2_32.dll",
             "bcrypt.dll",
             "crypt32.dll",
             "ncrypt.dll",
             "winhttp.dll",
-            "dnsapi.dll",
             "sspicli.dll",
             "cabinet.dll",
             "avrt.dll",
@@ -44,6 +44,13 @@ impl Default for HostPolicy {
             "ole32.dll",
             "advapi32.dll",
             "iphlpapi.dll",
+            // The title's crash handler writes minidumps with it (loaded by name).
+            "dbghelp.dll",
+            // Same APIs as the console's (XAudio2 ordinal 1 is XAudio2Create
+            // on both); Media Foundation reads local media files.
+            "xaudio2_9.dll",
+            "mfplat.dll",
+            "mfreadwrite.dll",
         ];
         HostPolicy {
             allow: allow.iter().map(|s| s.to_string()).collect(),

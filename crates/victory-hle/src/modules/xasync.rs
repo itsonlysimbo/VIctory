@@ -100,13 +100,15 @@ impl Port {
             ready: Condvar::new(),
         });
         if mode == Mode::Serialized {
-            // shortcut: the worker lives as long as the process, even after
-            // the queue closes; join it on close if titles churn queues.
+            // The worker ends once it holds the last reference (every queue
+            // using the port is closed) and nothing is left to run.
             let worker = port.clone();
             std::thread::spawn(move || {
                 loop {
-                    if let Some(task) = worker.take(INFINITE) {
-                        task.run(false);
+                    match worker.take(1000) {
+                        Some(task) => task.run(false),
+                        None if Arc::strong_count(&worker) == 1 => break,
+                        None => {}
                     }
                 }
             });
@@ -117,9 +119,7 @@ impl Port {
     fn submit(&self, task: Task) {
         match self.mode {
             Mode::Immediate => task.run(false),
-            // shortcut: a thread per callback, not a pool; fine at startup
-            // rates, pool them if a title submits thousands per frame.
-            Mode::ThreadPool => drop(std::thread::spawn(move || task.run(false))),
+            Mode::ThreadPool => POOL.submit(task),
             Mode::Manual | Mode::Serialized => {
                 lock(&self.tasks).push_back(task);
                 self.ready.notify_one();
@@ -142,6 +142,49 @@ impl Port {
                 .0
         };
         tasks.pop_front()
+    }
+}
+
+/// The thread pool behind thread-pool ports: idle workers are reused, and a
+/// new one starts whenever more tasks wait than workers idle, so a callback
+/// that blocks on another never starves it. Workers stay for reuse.
+struct Pool {
+    /// Queued tasks and the number of idle workers.
+    state: Mutex<(VecDeque<Task>, usize)>,
+    ready: Condvar,
+}
+
+static POOL: Pool = Pool {
+    state: Mutex::new((VecDeque::new(), 0)),
+    ready: Condvar::new(),
+};
+
+impl Pool {
+    fn submit(&'static self, task: Task) {
+        let mut state = lock(&self.state);
+        state.0.push_back(task);
+        if state.0.len() > state.1 {
+            std::thread::spawn(move || self.work());
+        } else {
+            self.ready.notify_one();
+        }
+    }
+
+    fn work(&self) {
+        let mut state = lock(&self.state);
+        loop {
+            while state.0.is_empty() {
+                state.1 += 1;
+                state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
+                state.1 -= 1;
+            }
+            let task = state.0.pop_front();
+            drop(state);
+            if let Some(task) = task {
+                task.run(false);
+            }
+            state = lock(&self.state);
+        }
     }
 }
 
@@ -641,16 +684,167 @@ pub fn XAsyncGetResult(
 /// Starts a call on `block` that is already over: it completes with `hr`
 /// and no result data, through the block's completion port as usual.
 pub fn finished(block: *mut AsyncBlock, identity: *const c_void, hr: HRESULT) -> HRESULT {
+    finished_with(
+        block,
+        identity,
+        if hr < 0 { Err(hr) } else { Ok(Vec::new()) },
+    )
+}
+
+/// Like [`finished`], with the bytes `XAsyncGetResult` hands out for
+/// `identity` (an error has none).
+pub fn finished_with(
+    block: *mut AsyncBlock,
+    identity: *const c_void,
+    result: Result<Vec<u8>, HRESULT>,
+) -> HRESULT {
+    type Data = Result<Vec<u8>, HRESULT>;
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
-        // SAFETY: the runtime passes valid provider data.
+        // SAFETY: the runtime passes valid provider data; the context is the
+        // boxed result until cleanup frees it.
         let data = unsafe { &*data };
-        if op == OP_BEGIN {
-            XAsyncComplete(data.block, data.context as usize as u32 as i32, 0);
+        let result = data.context.cast::<Data>();
+        match op {
+            // SAFETY: boxed in `finished_with`; nothing runs after cleanup.
+            OP_CLEANUP => drop(unsafe { Box::from_raw(result) }),
+            OP_BEGIN => {
+                // SAFETY: as above. Copied out: completing may clean up.
+                let (hr, len) = match unsafe { &*result } {
+                    Ok(bytes) => (S_OK, bytes.len()),
+                    Err(hr) => (*hr, 0),
+                };
+                XAsyncComplete(data.block, hr, len);
+            }
+            // SAFETY: as above; the runtime checked the buffer's size.
+            OP_GET_RESULT => unsafe {
+                if let Ok(bytes) = &*result {
+                    data.buffer
+                        .cast::<u8>()
+                        .copy_from(bytes.as_ptr(), bytes.len());
+                }
+            },
+            _ => {}
         }
         S_OK
     }
-    let context = hr as u32 as usize as *mut c_void;
-    XAsyncBegin(block, context, identity, std::ptr::null(), Some(provider))
+    let context = Box::into_raw(Box::new(result));
+    let hr = XAsyncBegin(
+        block,
+        context.cast(),
+        identity,
+        std::ptr::null(),
+        Some(provider),
+    );
+    if hr < 0 {
+        // Refused before the call existed, so no cleanup will come.
+        // SAFETY: still ours.
+        drop(unsafe { Box::from_raw(context) });
+    }
+    hr
+}
+
+/// Like [`finished_with`], but the result comes from `work`, run on a
+/// thread of ours; the call stays pending until it returns (a dialog, say).
+pub fn pending_with(
+    block: *mut AsyncBlock,
+    identity: *const c_void,
+    work: impl FnOnce() -> Result<Vec<u8>, HRESULT> + Send + 'static,
+) -> HRESULT {
+    type Data = Mutex<(Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>, Vec<u8>)>;
+    extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+        // SAFETY: the runtime passes valid provider data; the context is the
+        // boxed state until cleanup frees it.
+        let data = unsafe { &*data };
+        let state = data.context.cast::<Data>();
+        match op {
+            // SAFETY: boxed in `pending_with`; nothing runs after cleanup.
+            OP_CLEANUP => drop(unsafe { Box::from_raw(state) }),
+            OP_BEGIN => {
+                // SAFETY: as above; cleanup waits for completion.
+                let work = unsafe { &*state }.lock().unwrap_or_else(|e| e.into_inner()).0.take();
+                let (block, state) = (data.block as usize, state as usize);
+                std::thread::spawn(move || {
+                    let result = work.map_or(Err(E_ABORT), |work| work());
+                    let (hr, len) = match &result {
+                        Ok(bytes) => (S_OK, bytes.len()),
+                        Err(hr) => (*hr, 0),
+                    };
+                    if let Ok(bytes) = result {
+                        // SAFETY: the call is pending, so its state lives.
+                        let state = unsafe { &*(state as *const Data) };
+                        state.lock().unwrap_or_else(|e| e.into_inner()).1 = bytes;
+                    }
+                    XAsyncComplete(block as *mut AsyncBlock, hr, len);
+                });
+            }
+            // SAFETY: as above; the runtime checked the buffer's size.
+            OP_GET_RESULT => unsafe {
+                let state = (*state).lock().unwrap_or_else(|e| e.into_inner());
+                data.buffer
+                    .cast::<u8>()
+                    .copy_from(state.1.as_ptr(), state.1.len());
+            },
+            _ => {}
+        }
+        S_OK
+    }
+    let state: Box<Data> = Box::new(Mutex::new((Some(Box::new(work)), Vec::new())));
+    let context = Box::into_raw(state);
+    let hr = XAsyncBegin(block, context.cast(), identity, std::ptr::null(), Some(provider));
+    if hr < 0 {
+        // SAFETY: refused before the call existed; still ours.
+        drop(unsafe { Box::from_raw(context) });
+    }
+    hr
+}
+
+/// The result of a call begun with [`finished_with`] for `identity`, as a
+/// `T` written through `out`.
+pub fn result<T>(block: *mut AsyncBlock, identity: *const c_void, out: *mut T) -> HRESULT {
+    XAsyncGetResult(
+        block,
+        identity,
+        size_of::<T>(),
+        out.cast(),
+        std::ptr::null_mut(),
+    )
+}
+
+/// The bytes of a value, for [`finished_with`].
+pub fn bytes<T: Copy>(value: T) -> Vec<u8> {
+    // SAFETY: a `Copy` value is plain data; padding bytes are never read.
+    unsafe { std::slice::from_raw_parts((&raw const value).cast::<u8>(), size_of::<T>()) }.to_vec()
+}
+
+type Work = extern "system" fn(*mut AsyncBlock) -> HRESULT;
+
+/// Runs `work` on the block's work port as an async call of its own; its
+/// return value is the call's result.
+pub fn XAsyncRun(block: *mut AsyncBlock, work: Option<Work>) -> HRESULT {
+    extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+        // SAFETY: the runtime passes valid provider data.
+        let data = unsafe { &*data };
+        match op {
+            OP_BEGIN => XAsyncSchedule(data.block, 0),
+            OP_DO_WORK => {
+                // SAFETY: the context is the `Work` given to `XAsyncRun`.
+                let work = unsafe { std::mem::transmute::<*mut c_void, Work>(data.context) };
+                work(data.block)
+            }
+            _ => S_OK,
+        }
+    }
+    let Some(work) = work else {
+        return E_INVALIDARG;
+    };
+    let identity = XAsyncRun as *const c_void;
+    XAsyncBegin(
+        block,
+        work as *mut c_void,
+        identity,
+        std::ptr::null(),
+        Some(provider),
+    )
 }
 
 // The object `QueryApiImpl` returns. Each method takes the object first,
@@ -670,6 +864,9 @@ extern "system" fn m_get_result_size(_: This, b: *mut AsyncBlock, out: *mut usiz
 }
 extern "system" fn m_cancel(_: This, b: *mut AsyncBlock) {
     XAsyncCancel(b)
+}
+extern "system" fn m_run(_: This, b: *mut AsyncBlock, work: Option<Work>) -> HRESULT {
+    XAsyncRun(b, work)
 }
 extern "system" fn m_begin(
     _: This,
@@ -787,7 +984,7 @@ static VTABLE: Methods<31> = Methods([
     m_get_status as *const (),         // 0x18
     m_get_result_size as *const (),    // 0x20
     m_cancel as *const (),             // 0x28
-    missing::<6> as *const (),         // 0x30 run a work callback as a call
+    m_run as *const (),                // 0x30
     m_begin as *const (),              // 0x38
     missing::<8> as *const (),         // 0x40
     m_schedule as *const (),           // 0x48
@@ -924,6 +1121,61 @@ mod tests {
         );
         assert_eq!((value, used), (42, 8));
         assert!(call(&mut block).is_none(), "the call ends with its result");
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn run_returns_the_work_result() {
+        extern "system" fn work(_: *mut AsyncBlock) -> HRESULT {
+            E_ABORT
+        }
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        assert_eq!(
+            slot::<extern "system" fn(This, *mut AsyncBlock, Option<Work>) -> HRESULT>(0x30)(
+                &OBJECT,
+                &mut block,
+                Some(work)
+            ),
+            S_OK
+        );
+        assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
+    }
+
+    #[test]
+    fn pool_callbacks_may_wait_for_each_other() {
+        static SECOND: AtomicBool = AtomicBool::new(false);
+        static FIRST: AtomicBool = AtomicBool::new(false);
+        extern "system" fn waits(_: *mut c_void, _: bool) {
+            let start = std::time::Instant::now();
+            while !SECOND.load(Ordering::SeqCst) && start.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            FIRST.store(SECOND.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+        extern "system" fn releases(_: *mut c_void, _: bool) {
+            SECOND.store(true, Ordering::SeqCst);
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 1, &mut q), S_OK);
+        let none = std::ptr::null_mut();
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(q, WORK, 0, none, Some(waits)),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(q, WORK, 0, none, Some(releases)),
+            S_OK
+        );
+        let start = std::time::Instant::now();
+        while !FIRST.load(Ordering::SeqCst) && start.elapsed().as_secs() < 10 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(FIRST.load(Ordering::SeqCst));
         XTaskQueueCloseHandle(q);
     }
 

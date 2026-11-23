@@ -20,6 +20,7 @@ windows-sys = { workspace = true, features = [
     "Wdk_System_Threading",
     "Win32_Foundation",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Kernel",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
@@ -28,6 +29,10 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[features]
+# Debugging switches (scheduled stack dumps and the like).
+diagnostics = []
 
 [lints]
 workspace = true
