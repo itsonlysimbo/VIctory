@@ -11,7 +11,9 @@ use victory_loader::{
     unimplemented_call_count,
 };
 use victory_pe::ImportSymbol;
+use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+use windows_sys::Win32::System::Threading::{CreateThread, INFINITE, WaitForSingleObject};
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
@@ -190,7 +192,21 @@ fn loads_binds_and_calls_probe() {
         image.attach().unwrap();
         let f: extern "system" fn() -> u64 = std::mem::transmute(call("probe_thread_starts"));
         let before = f();
-        std::thread::spawn(|| {}).join().unwrap();
+        // Starting in title code, as a title's threads do (ours start in
+        // our exe and are left out); the extra argument is ignored.
+        let start: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32 =
+            std::mem::transmute(call("probe_pid"));
+        let thread = CreateThread(
+            std::ptr::null(),
+            0,
+            Some(start),
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+        );
+        assert!(!thread.is_null());
+        WaitForSingleObject(thread, INFINITE);
+        CloseHandle(thread);
         let after = f();
         assert!(
             after >> 32 > before >> 32,

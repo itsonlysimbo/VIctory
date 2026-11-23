@@ -71,7 +71,7 @@ pub fn disable_thread_calls(base: usize) -> Option<bool> {
 static ON_THREAD: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) = on_thread;
 
 unsafe extern "system" fn on_thread(_: *mut c_void, reason: u32, _: *mut c_void) {
-    if reason != DLL_THREAD_ATTACH && reason != DLL_THREAD_DETACH {
+    if reason != DLL_THREAD_ATTACH && reason != DLL_THREAD_DETACH || started_by_rust() {
         return;
     }
     // A snapshot: title code may map and attach another DLL from here.
@@ -90,4 +90,46 @@ unsafe extern "system" fn on_thread(_: *mut c_void, reason: u32, _: *mut c_void)
     } else {
         notify.iter().rev().for_each(notify_one);
     }
+}
+
+/// Whether Rust's std started this thread (its start routine is in our
+/// exe): the title's main thread and our runtime's workers. They get no
+/// notices: std aborts the process if anything on such a thread asks for
+/// the current thread (as stdout and stderr locks do) before its start
+/// routine has run, and title code may call our runtime, which logs.
+// shortcut: title code on our workers (xasync callbacks) runs without
+// thread notices; send them from the worker's start if a title needs them.
+fn started_by_rust() -> bool {
+    use windows_sys::Wdk::System::Threading::{
+        NtQueryInformationThread, ThreadQuerySetWin32StartAddress,
+    };
+    use windows_sys::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        GetModuleHandleExW, GetModuleHandleW,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentThread;
+
+    let mut start = 0usize;
+    // SAFETY: writes one pointer-sized start address.
+    let status = unsafe {
+        NtQueryInformationThread(
+            GetCurrentThread(),
+            ThreadQuerySetWin32StartAddress,
+            (&raw mut start).cast(),
+            size_of::<usize>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    let mut module = std::ptr::null_mut();
+    // SAFETY: looks up the module containing an address, taking no reference.
+    status == 0
+        && unsafe {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                start as *const u16,
+                &mut module,
+            )
+        } != 0
+        // SAFETY: our own exe's handle.
+        && module == unsafe { GetModuleHandleW(std::ptr::null()) }
 }
