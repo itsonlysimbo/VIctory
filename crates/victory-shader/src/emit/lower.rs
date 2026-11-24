@@ -975,6 +975,47 @@ impl<'a> Lower<'a> {
         Ok(if float { self.as_int(r) } else { r })
     }
 
+    /// What keeps a program reading a lane mask that holds lanes outside
+    /// EXEC where it is written out of the console flow ([`CONSOLE_FLOW`]),
+    /// where every lane runs every block and a ballot holds them all: the
+    /// same as in [`Self::new`]. `None`: it can take the console flow.
+    fn console_flow_blocker(&self) -> Option<Why> {
+        const ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
+        let x = self.x;
+        let StageIo::Cs(cs) = &x.native.io else {
+            return Some(ELSEWHERE);
+        };
+        if x.console_cf || x.per_lane_only {
+            return Some(ELSEWHERE);
+        }
+        if let Some(why) = self.no_console_flow {
+            return Some(why);
+        }
+        let p = x.p;
+        if p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name().contains("permute")) {
+            return Some("a lane mask holding lanes elsewhere read as data, in a program with ds_permute");
+        }
+        // Whole-wave sections lower to wave operations over the host's
+        // active lanes, each lane's input its own unless its bit of the
+        // section's EXEC is clear ([`Self::shape`]). In the console flow on a
+        // host running the console's wave size, every lane of the wave is
+        // active in every block: the operation is the console's.
+        let wave = if x.native.wave64 { 64 } else { 32 };
+        if x.target.runs(wave) {
+            return None;
+        }
+        if !(0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty()) {
+            return Some("a lane mask holding lanes elsewhere read as data, in a wave64 program with whole-wave sections on a host without 64-lane waves");
+        }
+        if !x.native.wave64 || !x.target.runs(32) {
+            return Some(ELSEWHERE);
+        }
+        if cs.threads.iter().product::<u32>() > 64 {
+            return Some("a lane mask holding lanes elsewhere read as data, in a wave64 group of more than 64 threads on a host without 64-lane waves");
+        }
+        None
+    }
+
     fn run(mut self) -> Result<Lowered, Stop> {
         if self.wants_console_flow && !self.x.console_cf && !self.x.per_lane_only {
             return Err(unsupported(0, CONSOLE_FLOW));
@@ -1382,7 +1423,14 @@ impl<'a> Lower<'a> {
             return Err("a lane mask read whole in a wave64 program split in halves");
         }
         if !self.x.st.active.contains(&lo) {
-            return Err("a lane mask holding lanes elsewhere read as data");
+            // Lanes outside EXEC where the mask is written are not there to
+            // ballot. In the console flow every lane runs every block, so
+            // the ballot there holds them: retry in it where the program
+            // can take it.
+            return Err(match self.console_flow_blocker() {
+                None => CONSOLE_FLOW,
+                Some(why) => why,
+            });
         }
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
