@@ -251,6 +251,8 @@ fn create() -> windows::core::Result<Host> {
             }
         }
         let mut device: Option<ID3D12Device> = None;
+        let mut selected_adapter_name = String::new();
+        let mut selected_vram_mb = 0;
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
@@ -259,7 +261,33 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // Find high-performance discrete GPU if available.
+            let mut best_adapter: Option<(IDXGIAdapter1, String, usize)> = None;
+            if let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) {
+                let mut i = 0;
+                while let Ok(adapter) = factory.EnumAdapters1(i) {
+                    if let Ok(desc) = adapter.GetDesc1()
+                        && (desc.Flags as i32 & DXGI_ADAPTER_FLAG_SOFTWARE.0) == 0
+                    {
+                        let name = String::from_utf16_lossy(&desc.Description)
+                            .trim_matches('\0')
+                            .to_owned();
+                        let vram = desc.DedicatedVideoMemory;
+                        if best_adapter.as_ref().map_or(true, |(_, _, best_vram)| vram > *best_vram) {
+                            best_adapter = Some((adapter, name, vram));
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            if let Some((adapter, name, vram)) = best_adapter {
+                selected_adapter_name = name;
+                selected_vram_mb = vram / (1024 * 1024);
+                let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device);
+            }
+            if device.is_none() {
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
@@ -285,7 +313,11 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        tracing::info!("host D3D12 device ready");
+        if !selected_adapter_name.is_empty() {
+            tracing::info!(gpu = %selected_adapter_name, vram_mb = selected_vram_mb, "host D3D12 device ready");
+        } else {
+            tracing::info!("host D3D12 device ready");
+        }
         Ok(Host {
             device,
             queue,
@@ -420,7 +452,7 @@ type Buffers = std::collections::HashMap<usize, (u32, std::sync::Arc<crate::shad
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
+        std::env::var_os("VICTORY_D3D12_DRED").is_some()
     })
 }
 
@@ -592,6 +624,7 @@ impl Host {
                 &allocator,
                 None,
             )?;
+            name(&list, || "host command list".into());
             let prelude_allocator: ID3D12CommandAllocator = self
                 .device
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
@@ -601,6 +634,7 @@ impl Host {
                 &prelude_allocator,
                 None,
             )?;
+            name(&prelude, || "host prelude command list".into());
             prelude.Close()?;
             Ok(HostList {
                 allocator,
@@ -644,22 +678,17 @@ impl Host {
         batch.flush();
         let retired = take_retired();
         let prepared = std::time::Instant::now();
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
-        #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        // Slicing: each list (prelude + list) submitted on its own with fence sync.
+        // This resets the Windows WDDM 2.0-second TDR watchdog between lists,
+        // preventing DXGI_ERROR_DEVICE_RESET / HUNG on large submissions.
+        let groups: Vec<&[Option<ID3D12CommandList>]> = firsts
+            .iter()
+            .zip(firsts.iter().skip(1).chain([&lists.len()]))
+            .map(|(&a, &b)| &lists[a..b])
+            .collect();
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
-            let started = std::time::Instant::now();
+            let list_started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -675,16 +704,26 @@ impl Host {
                 }
             }
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+            if list_started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
+                tracing::warn!(ms = list_started.elapsed().as_millis(), commands, "slow host list");
                 for (ms, op) in runs[i].slowest(frequency, 6) {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
-            let _ = (i, started);
+            // SAFETY: a plain query - check device removal immediately after each list.
+            if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                fail(format_args!(
+                    "host GPU device removed during list {i} of {} (submission of {} lists){}{}",
+                    groups.len(),
+                    runs.len(),
+                    self.removal_data(runs),
+                    last_notes(runs)
+                ));
+            }
+            let _ = (i, list_started);
         }
         let _ = &firsts;
         let gpu = prepared.elapsed();
@@ -799,7 +838,9 @@ impl Host {
             while let Some(p) = node.as_ref() {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
                 let ours = p.pCommandList.as_ref().map(|l| l.as_raw());
-                let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
+                let index = runs.iter().position(|r| {
+                    Some(r.list.as_raw()) == ours || Some(r.prelude.1.as_raw()) == ours
+                });
                 progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
                 node = p.pNext;
             }
@@ -815,7 +856,9 @@ impl Host {
                         p.BreadcrumbCount, history[done as usize].0
                     ));
                     let list = p.pCommandList.as_ref().map(|l| l.as_raw());
-                    let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
+                    let run = runs.iter().find(|r| {
+                        Some(r.list.as_raw()) == list || Some(r.prelude.1.as_raw()) == list
+                    });
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
                     let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
@@ -1087,6 +1130,8 @@ impl HostList {
     /// states become those the list ends with.
     fn prelude(&self) -> Option<ID3D12CommandList> {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        // Buffer copies need nothing here: every list starts and ends with
+        // them in the common state (`close`).
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
             .filter_map(|(first, last, copy)| {

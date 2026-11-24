@@ -167,8 +167,6 @@ pub(crate) fn bound(
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
-        // Earlier shader writes (the title's argument passes) first.
-        l.ResourceBarrier(&[uav_barrier()]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);

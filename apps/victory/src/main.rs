@@ -3,6 +3,12 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+#[unsafe(no_mangle)]
+pub static NvOptimusEnablement: u32 = 0x00000001;
+
+#[unsafe(no_mangle)]
+pub static AmdPowerXpressRequestHighPerformance: i32 = 1;
+
 mod census;
 mod inspect;
 mod run;

@@ -487,6 +487,16 @@ fn enclosing_window<V>(windows: &BTreeMap<(u64, u64), V>, span: u64, address: u6
 /// that holds it (a range spanning two windows has one of its own, which
 /// later ranges in it share), else a new one. None for memory that is not
 /// committed (a stale or null address): 4 MiB of zeros would not help.
+pub(crate) fn evict_loose(at: usize, len: usize) {
+    let at = at as u64;
+    let len = len as u64;
+    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    map.retain(|&(start, size), _| {
+        let end = start.saturating_add(size);
+        !(start < at + len && at < end)
+    });
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if address < LOWEST_MAPPED {
         return None;
@@ -500,6 +510,21 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if !crate::texture::committed(address as *const u8, 1) {
         return None;
     }
+
+    const MAX_LOOSE: usize = 128;
+    const TARGET_LOOSE: usize = 96;
+    if map.len() >= MAX_LOOSE {
+        let keys: Vec<(u64, u64)> = map
+            .iter()
+            .filter(|(_, s)| Arc::strong_count(s) <= 1)
+            .map(|(&k, _)| k)
+            .collect();
+        let count_to_remove = map.len().saturating_sub(TARGET_LOOSE);
+        for k in keys.into_iter().take(count_to_remove) {
+            map.remove(&k);
+        }
+    }
+
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
