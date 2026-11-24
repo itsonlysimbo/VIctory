@@ -239,17 +239,21 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 
 /// The format a render target or unordered-access texture of `format` is
 /// made in on the host, and that render target views and pipelines name:
-/// `R16G16B16A16_FLOAT` (10) for `R9G9B9E5_SHAREDEXP` (67), which PC D3D12
-/// forbids as a render target or unordered-access resource; else
-/// [`pc_format`]. Textures only sampled keep `R9G9B9E5_SHAREDEXP`.
+/// `R16G16B16A16_FLOAT` (10) for `R9G9B9E5_SHAREDEXP` (67) and
+/// `R8G8B8A8_UNORM` (28) for `B5G5R5A1_UNORM` (86), which PC D3D12 forbids
+/// as a render target or unordered-access resource (86 has no typed
+/// unordered access); else [`pc_format`]. Textures only sampled keep their
+/// format. The stand-ins hold every value of the console format, channel
+/// for channel.
 pub(crate) fn target_format(format: u32) -> u32 {
     const R9G9B9E5_SHAREDEXP: u32 = 67;
     const RGBA16_FLOAT: u32 = 10;
-    let format = pc_format(format);
-    if format == R9G9B9E5_SHAREDEXP {
-        RGBA16_FLOAT
-    } else {
-        format
+    const B5G5R5A1_UNORM: u32 = 86;
+    const RGBA8_UNORM: u32 = 28;
+    match pc_format(format) {
+        R9G9B9E5_SHAREDEXP => RGBA16_FLOAT,
+        B5G5R5A1_UNORM => RGBA8_UNORM,
+        format => format,
     }
 }
 
@@ -1962,6 +1966,8 @@ mod tests {
         assert_eq!(target_format(67), 10);
         assert_eq!(target_format(28), 28);
         assert_eq!(target_format(118), 45);
+        assert_eq!(pc_format(86), 86);
+        assert_eq!(target_format(86), 28);
     }
 
     #[cfg(windows)]
@@ -1983,8 +1989,10 @@ mod tests {
             layout: 0,
             flags,
         };
-        for (flags, expected_host_format) in [(0, 67), (4, 10), (5, 10)] {
-            let d = tex_desc(flags);
+        for (format, flags, expected_host_format) in
+            [(67, 0, 67), (67, 4, 10), (67, 5, 10), (86, 0, 86), (86, 5, 28)]
+        {
+            let d = ResourceDesc { format, ..tex_desc(flags) };
             let mut out = std::ptr::null();
             let hr = create_committed(
                 std::ptr::null(),
