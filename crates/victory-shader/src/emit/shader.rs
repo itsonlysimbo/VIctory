@@ -15,6 +15,10 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// Where the host's runtime stride table is bound: `t0` in this space
 /// (one `u32` element stride per view-heap slot).
 pub const STRIDE_SPACE: u32 = 2;
+/// Dwords per view-heap slot in that table: the element stride, the
+/// console descriptor's NUM_RECORDS (its dword 2), its dword 1 with only the
+/// stride field (bits 16..30) set, and a word kept for its dword 3.
+pub const SLOT_TABLE_DWORDS: u32 = 4;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

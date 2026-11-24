@@ -3325,7 +3325,7 @@ impl<'a> Lower<'a> {
                             super::declares_structured_buffer(part, b.lower_bound, uav)
                         })
                 }) else {
-                    return Err("a descriptor read only as data");
+                    return self.records_from_table(inst, site, code, count, *address);
                 };
                 ((12 | u, binding.stride), None)
             }
@@ -3392,6 +3392,50 @@ impl<'a> Lower<'a> {
                         self.vals.insert(v, Val::Missing(OTHER));
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// A view descriptor read only as data with no binding to ask: its
+    /// NUM_RECORDS (dword 2 of its slot) and its stride field (dword 1, as
+    /// HLSL's `GetDimensions` of a structured buffer reads it; the address
+    /// bits there read as 0) come from the host's runtime table, which
+    /// holds what the console descriptor of the view the title wrote there
+    /// holds (0 for views other than buffers). Other dwords stay refused.
+    fn records_from_table(
+        &mut self,
+        inst: &Inst,
+        site: Site,
+        code: u8,
+        count: u32,
+        address: Address,
+    ) -> Result<(), Why> {
+        const WHY: Why = "a descriptor read only as data";
+        let slot_bytes = 32;
+        let at = address.offset % slot_bytes;
+        // Every loaded dword's place in its slot; the slot is that of the
+        // first (`heap_slot` divides the address by the slot size).
+        let words: Vec<u32> = (0..count).map(|k| at + 4 * k).collect();
+        if words.last().is_some_and(|&w| w >= slot_bytes)
+            || !words.iter().any(|w| matches!(w, 4 | 8))
+        {
+            return Err(WHY);
+        }
+        let src = Source::Loaded { load: site, first: 0 };
+        let slot = self.heap_slot(&src, false).map_err(|_| WHY)?;
+        for k in 0..count {
+            let reg = Reg::S(code + k as u8);
+            let table_word = match words[k as usize] {
+                4 => Some(2),
+                8 => Some(1),
+                _ => None,
+            };
+            if let Some(w) = table_word {
+                let x = self.slot_table_word(slot, w);
+                self.write(inst, reg, x, None);
+            } else if let Some(v) = inst.write(reg) {
+                self.vals.insert(v, Val::Missing("a descriptor's address or format read as data"));
             }
         }
         Ok(())
@@ -3840,17 +3884,15 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Byte offset `index * stride + off` for a structured buffer whose
-    /// stride was not recovered statically, reading `stride` from the host's
-    /// runtime stride table (`t0`, [`super::STRIDE_SPACE`]).
-    fn runtime_stride_offset(&mut self, src: &Source, index: V, off: V) -> Result<V, Why> {
-        let slot = self
-            .heap_slot(src, false)
-            .map_err(|_| "a structured buffer of unknown stride")?;
+    /// Word `word` of view-heap slot `slot` in the host's runtime table
+    /// (`t0`, [`super::STRIDE_SPACE`]; [`super::SLOT_TABLE_DWORDS`] a slot).
+    fn slot_table_word(&mut self, slot: V, word: u32) -> V {
         let c = self.cur;
         let table = self.s.stride_table_handle();
-        let four = self.s.m.i32(4);
-        let addr = self.s.m.bin(c, Bin::Mul, slot, four);
+        let size = self.s.m.i32(4 * super::SLOT_TABLE_DWORDS);
+        let addr = self.s.m.bin(c, Bin::Mul, slot, size);
+        let off = self.s.m.i32(4 * word);
+        let addr = self.s.m.bin(c, Bin::Add, addr, off);
         let iu = self.s.m.undef(self.s.t.i32);
         let mask = self.s.m.i8(1);
         let align = self.s.m.i32(4);
@@ -3862,8 +3904,19 @@ impl<'a> Lower<'a> {
             139,
             &[table, addr, iu, mask, align],
         );
-        let stride_f = self.s.m.extract(c, res, 0);
-        let stride = self.as_int(stride_f);
+        let f = self.s.m.extract(c, res, 0);
+        self.as_int(f)
+    }
+
+    /// Byte offset `index * stride + off` for a structured buffer whose
+    /// stride was not recovered statically, reading `stride` from the host's
+    /// runtime stride table (`t0`, [`super::STRIDE_SPACE`]).
+    fn runtime_stride_offset(&mut self, src: &Source, index: V, off: V) -> Result<V, Why> {
+        let slot = self
+            .heap_slot(src, false)
+            .map_err(|_| "a structured buffer of unknown stride")?;
+        let stride = self.slot_table_word(slot, 0);
+        let c = self.cur;
         let elem_off = self.s.m.bin(c, Bin::Mul, index, stride);
         Ok(self.s.m.bin(c, Bin::Add, elem_off, off))
     }

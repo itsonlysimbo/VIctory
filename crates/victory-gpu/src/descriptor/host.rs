@@ -47,7 +47,8 @@ struct StrideTable {
 
 impl StrideTable {
     fn new(device: &ID3D12Device, len: u32) -> Option<Self> {
-        let bytes = (u64::from(len) * 4).max(4);
+        // Two dwords a slot: [`SLOT_DWORDS`].
+        let bytes = (u64::from(len) * 4 * SLOT_DWORDS).max(4);
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: bytes,
@@ -203,7 +204,8 @@ impl HostHeap {
         let strides = if sampler {
             None
         } else {
-            StrideTable::new(&host.device, count + extra)
+            // Every slot a shader may index, the guard slot included.
+            StrideTable::new(&host.device, count + extra + guard)
         };
         let h = HostHeap {
             heap,
@@ -380,7 +382,7 @@ impl HostHeap {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
-        self.set_stride(index, if ok { view_stride(view) } else { 0 });
+        self.set_slot(index, if ok { slot_words(view) } else { [0; 4] });
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -391,7 +393,7 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
-        self.set_stride(index, 0);
+        self.set_slot(index, [0; 4]);
     }
 
     /// Makes slot `index` a null view matching the resource kind a shader
@@ -453,12 +455,20 @@ impl HostHeap {
         }
     }
 
-    fn set_stride(&self, index: u32, stride: u32) {
+    /// Slot `index`'s words in the table: its element stride and the
+    /// NUM_RECORDS its console descriptor holds ([`slot_words`]).
+    fn set_slot(&self, index: u32, words: [u32; 4]) {
         if let Some(t) = &self.strides
             && index < t.len
         {
-            // SAFETY: `t.ptr` points to a live mapped UPLOAD buffer of `t.len` dwords.
-            unsafe { *(t.ptr as *mut u32).add(index as usize) = stride };
+            // SAFETY: `t.ptr` points to a live mapped UPLOAD buffer of
+            // `t.len` slots of two dwords.
+            unsafe {
+                let at = (t.ptr as *mut u32).add(index as usize * SLOT_DWORDS as usize);
+                for (k, w) in words.into_iter().enumerate() {
+                    at.add(k).write(w);
+                }
+            }
         }
     }
 
@@ -471,7 +481,7 @@ impl HostHeap {
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
-        self.set_stride(index, 0);
+        self.set_slot(index, [0; 4]);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
@@ -537,7 +547,7 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
-            self.set_stride(index, if ok { view_stride(&view) } else { 0 });
+            self.set_slot(index, if ok { slot_words(&view) } else { [0; 4] });
         }
         Some(view)
     }
@@ -701,6 +711,104 @@ fn view_stride(view: &View) -> u32 {
         _ => 0,
     };
     u32::try_from(bytes).unwrap_or(0)
+}
+
+/// Dwords per slot in the runtime table: the element stride
+/// ([`view_stride`]), then the console descriptor's NUM_RECORDS
+/// ([`view_records`]). The translator reads them at these offsets.
+const SLOT_DWORDS: u64 = victory_shader::emit::SLOT_TABLE_DWORDS as u64;
+
+/// A slot's words in the runtime table.
+fn slot_words(view: &View) -> [u32; 4] {
+    [view_stride(view), view_records(view), view_dword1(view), 0]
+}
+
+/// Dword 1 of the buffer descriptor the console holds for `view`, its
+/// stride field (bits 16..30) alone: the structure stride, a typed view's
+/// element size, 0 for raw views (whose NUM_RECORDS counts bytes). The
+/// address bits are the console's and mean nothing on the host.
+fn view_dword1(view: &View) -> u32 {
+    let raw = match view {
+        View::Shader(_, Some(desc)) => {
+            // SAFETY: a buffer view's union member.
+            let b = unsafe { srv_desc(desc).Anonymous.Buffer };
+            b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0
+        }
+        View::Unordered(_, _, Some(desc)) => {
+            // SAFETY: as above.
+            let b = unsafe { uav_desc(desc).Anonymous.Buffer };
+            b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0
+        }
+        View::Placed(uav, resource, desc) if resource[0] == 1 => {
+            let Ok(w) = <&[u32; 10]>::try_from(&desc[..10]) else {
+                return 0;
+            };
+            if *uav {
+                // SAFETY: as above.
+                let b = unsafe { uav_desc(w).Anonymous.Buffer };
+                b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0
+            } else {
+                // SAFETY: as above.
+                let b = unsafe { srv_desc(w).Anonymous.Buffer };
+                b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0
+            }
+        }
+        _ => return 0,
+    };
+    if raw || view_records(view) == 0 {
+        return 0;
+    }
+    (view_stride(view) & 0x3FFF) << 16
+}
+
+/// NUM_RECORDS (dword 2) of the buffer descriptor the console holds for
+/// `view`: elements for structured and typed views, bytes for raw ones, as
+/// `GetDimensions` of the host view gives them. 0 for other views.
+fn view_records(view: &View) -> u32 {
+    fn records(elements: u32, structured: bool, raw: bool) -> u32 {
+        if !structured && raw {
+            elements.saturating_mul(4)
+        } else {
+            elements
+        }
+    }
+    let srv = |w: &[u32; 10]| {
+        let d = srv_desc(w);
+        if d.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+            return 0;
+        }
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { d.Anonymous.Buffer };
+        records(
+            b.NumElements,
+            b.StructureByteStride > 0,
+            b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0,
+        )
+    };
+    let uav = |w: &[u32; 10]| {
+        let d = uav_desc(w);
+        if d.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+            return 0;
+        }
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { d.Anonymous.Buffer };
+        records(
+            b.NumElements,
+            b.StructureByteStride > 0,
+            b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0,
+        )
+    };
+    match view {
+        View::Shader(_, Some(desc)) => srv(desc),
+        View::Placed(false, resource, desc) if resource[0] == 1 => {
+            desc[..10].try_into().map_or(0, |w: &[u32; 10]| srv(w))
+        }
+        View::Unordered(_, _, Some(desc)) => uav(desc),
+        View::Placed(true, resource, desc) if resource[0] == 1 => {
+            desc[..10].try_into().map_or(0, |w: &[u32; 10]| uav(w))
+        }
+        _ => 0,
+    }
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
