@@ -213,9 +213,114 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// `VICTORY_DUMP_BUSY=<draws>[:<dumps>]`, with a capture folder: also
+/// dumps the targets of the first `dumps` (3) frames, at least 10 apart,
+/// whose host draws number `draws` or more: the world's frames, found
+/// without knowing their numbers.
+fn busy() -> Option<(usize, u64)> {
+    static BUSY: std::sync::OnceLock<Option<(usize, u64)>> = std::sync::OnceLock::new();
+    *BUSY.get_or_init(|| {
+        folder()?;
+        let v = std::env::var("VICTORY_DUMP_BUSY").ok()?;
+        let (min, dumps) = v.split_once(':').unwrap_or((&v, "3"));
+        Some((min.trim().parse().ok()?, dumps.trim().parse().ok()?))
+    })
+}
+
+static BUSY_DUMPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BUSY_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn busy_left() -> bool {
+    busy().is_some_and(|(_, dumps)| BUSY_DUMPED.load(std::sync::atomic::Ordering::Relaxed) < dumps)
+}
+
+/// At the present of frame `frame`: dumps the noted targets if the frame
+/// is listed or busy, and forgets them otherwise.
+pub(crate) fn frame_done(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if listed(frame) {
+        dump_targets(frame);
+        return;
+    }
+    let Some((min, _)) = busy() else { return };
+    static DRAWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = crate::draw::drawn();
+    let drawn = now - DRAWN.swap(now, Relaxed);
+    if drawn >= min as u64 && busy_left() && frame >= BUSY_LAST.load(Relaxed) + 10 {
+        tracing::info!(frame, drawn, "a busy frame: dumping its targets");
+        BUSY_DUMPED.fetch_add(1, Relaxed);
+        BUSY_LAST.store(frame, Relaxed);
+        log_draws(frame);
+        dump_targets(frame);
+    } else {
+        TARGETS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        DRAWS.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+}
+
+/// Per depth target (`usize::MAX`: a depth view with no host depth), the
+/// frame's draws: (first color target, tried, run, why dropped → count).
+type Tally =
+    std::collections::HashMap<usize, (usize, u64, u64, std::collections::HashMap<String, u64>)>;
+static DRAWS: std::sync::Mutex<Option<Tally>> = std::sync::Mutex::new(None);
+
+/// Counts a draw of the frame being built (with `VICTORY_DUMP_BUSY`).
+pub(crate) fn note_draw(depth: usize, color: usize, ran: bool, pipeline: usize) {
+    // The reason is taken either way, so a stale one is never reused.
+    let why = crate::pipeline::take_last_why();
+    if busy().is_none() || !busy_left() {
+        return;
+    }
+    let mut draws = DRAWS.lock().unwrap_or_else(|e| e.into_inner());
+    let e = draws
+        .get_or_insert_with(Default::default)
+        .entry(depth)
+        .or_default();
+    if e.0 == 0 {
+        e.0 = color;
+    }
+    e.1 += 1;
+    if ran {
+        e.2 += 1;
+    } else {
+        let why = why.unwrap_or_else(|| format!("no reason given (pipeline {pipeline:#x})"));
+        *e.3.entry(why).or_default() += 1;
+    }
+}
+
+fn log_draws(frame: u64) {
+    let draws = DRAWS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .unwrap_or_default();
+    let mut draws: Vec<_> = draws.into_iter().collect();
+    draws.sort_by_key(|d| std::cmp::Reverse(d.1.1));
+    for (depth, (color, tried, ran, why)) in draws {
+        tracing::info!(
+            frame,
+            depth = format_args!("{depth:#x}"),
+            color = format_args!("{color:#x}"),
+            tried,
+            ran,
+            "draws by depth target"
+        );
+        let mut why: Vec<_> = why.into_iter().collect();
+        why.sort_by_key(|w| std::cmp::Reverse(w.1));
+        for (w, n) in why.into_iter().take(8) {
+            tracing::info!(
+                frame,
+                depth = format_args!("{depth:#x}"),
+                n,
+                "  dropped: {w}"
+            );
+        }
+    }
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() || !dump_on() || !(listed(crate::queue::presented() + 1) || busy_left()) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
@@ -230,7 +335,9 @@ pub(crate) fn note_target(resource: crate::object::This) {
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
-    let Some(host) = crate::host::host() else { return };
+    let Some(host) = crate::host::host() else {
+        return;
+    };
     for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
@@ -240,7 +347,15 @@ pub(crate) fn dump_targets(frame: u64) {
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
-        dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
+        dump_one(
+            host,
+            texture,
+            state,
+            frame,
+            i,
+            *resource as crate::object::This,
+            &d,
+        );
     }
 }
 
@@ -271,7 +386,9 @@ fn dump_one(
     };
     list.close();
     host.execute(&[&list]);
-    let Some((buffer, footprint)) = read else { return };
+    let Some((buffer, footprint)) = read else {
+        return;
+    };
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished; the mapping spans the footprint's rows.
@@ -281,7 +398,13 @@ fn dump_one(
         }
         let pitch = f.RowPitch as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
-        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+        if let Some(rgba) = to_rgba(
+            f.Format.0 as u32,
+            f.Width as usize,
+            f.Height as usize,
+            pitch,
+            rows,
+        ) {
             let name = format!(
                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
@@ -295,7 +418,11 @@ fn dump_one(
 }
 
 fn half(h: u16) -> f32 {
-    let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
+    let (sign, exp, man) = (
+        (h >> 15) as u32,
+        ((h >> 10) & 0x1f) as i32,
+        (h & 0x3ff) as f32,
+    );
     let v = match exp {
         0 => man * 2f32.powi(-24),
         31 => f32::INFINITY,
@@ -323,7 +450,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
-    let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
+    let u32_at =
+        |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
     // Channel values as floats, then scaled.
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
@@ -345,22 +473,58 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             }
             return Some(out);
         }
-        23..=25 => (4, Box::new(move |b| {
-            let v = u32_at(b, 0);
-            [(v & 0x3ff) as f32, (v >> 10 & 0x3ff) as f32, (v >> 20 & 0x3ff) as f32]
-        })),
-        26 => (4, Box::new(move |b| {
-            let v = u32_at(b, 0);
-            [small_float(v & 0x7ff, 6), small_float(v >> 11 & 0x7ff, 6), small_float(v >> 22, 5)]
-        })),
-        9..=11 => (8, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), half(u16_at(b, 2))])),
-        33..=34 => (4, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), 0.0])),
-        1..=2 => (16, Box::new(move |b| {
-            [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))
-        })),
-        15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
-        35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
-        48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
+        23..=25 => (
+            4,
+            Box::new(move |b| {
+                let v = u32_at(b, 0);
+                [
+                    (v & 0x3ff) as f32,
+                    (v >> 10 & 0x3ff) as f32,
+                    (v >> 20 & 0x3ff) as f32,
+                ]
+            }),
+        ),
+        26 => (
+            4,
+            Box::new(move |b| {
+                let v = u32_at(b, 0);
+                [
+                    small_float(v & 0x7ff, 6),
+                    small_float(v >> 11 & 0x7ff, 6),
+                    small_float(v >> 22, 5),
+                ]
+            }),
+        ),
+        9..=11 => (
+            8,
+            Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), half(u16_at(b, 2))]),
+        ),
+        33..=34 => (
+            4,
+            Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), 0.0]),
+        ),
+        1..=2 => (
+            16,
+            Box::new(move |b| [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))),
+        ),
+        15..=16 => (
+            8,
+            Box::new(move |b| {
+                [
+                    f32::from_bits(u32_at(b, 0)),
+                    f32::from_bits(u32_at(b, 1)),
+                    0.0,
+                ]
+            }),
+        ),
+        35..=38 => (
+            4,
+            Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0]),
+        ),
+        48..=52 => (
+            2,
+            Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0]),
+        ),
         // Single channels (and depth planes): shown as grey.
         39..=43 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),

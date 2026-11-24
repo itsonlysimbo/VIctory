@@ -67,6 +67,8 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// The title's depth view handle (diagnostics: one with no host depth).
+    depth_handle: u64,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the host list has: pipeline, root signature, heaps.
@@ -149,7 +151,11 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         // be, not the one an earlier pass that wrote it left it in.
         list.want_buffer(
             &shadow,
-            if srv { BUFFER_SHADER_RESOURCE } else { BUFFER_VERTEX_CONSTANT },
+            if srv {
+                BUFFER_SHADER_RESOURCE
+            } else {
+                BUFFER_VERTEX_CONSTANT
+            },
         );
         return Some(gpu);
     }
@@ -200,6 +206,22 @@ impl State {
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
         self.pipeline = pipeline as usize;
+    }
+
+    /// Counts a draw for the frame's per-depth tally (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn tally(&self, ran: bool) {
+        let depth = if self.depth == 0 && self.depth_handle != 0 {
+            usize::MAX // a depth view with no host depth
+        } else {
+            self.depth
+        };
+        crate::capture::note_draw(
+            depth,
+            self.targets.first().copied().unwrap_or(0),
+            ran,
+            self.pipeline,
+        );
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -279,6 +301,7 @@ impl State {
             rtvs.push(host.rtv(texture, record.desc().as_ref()));
         }
         self.depth = 0;
+        self.depth_handle = depth;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
@@ -513,7 +536,11 @@ impl State {
                 for &(slot, param) in views {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
-                        once!(slot, srv, "a shader reads a root view the title did not set");
+                        once!(
+                            slot,
+                            srv,
+                            "a shader reads a root view the title did not set"
+                        );
                         return false;
                     };
                     let Some(gpu) = root_view(list, *address, srv) else {
@@ -656,6 +683,8 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        #[cfg(feature = "diagnostics")]
+        self.tally(ran);
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
@@ -915,6 +944,8 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        #[cfg(feature = "diagnostics")]
+        self.tally(ran);
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
@@ -1003,6 +1034,8 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        #[cfg(feature = "diagnostics")]
+        self.tally(ran);
     }
 }
 

@@ -104,10 +104,15 @@ fn dump_container(hash: &str, bytes: &[u8]) {
         std::sync::LazyLock::new(|| {
             let hashes = std::env::var("VICTORY_DUMP_SHADERS").ok()?;
             let dir = std::env::var_os("VICTORY_DUMP_DIR")?;
-            let hashes = hashes.split(',').map(|h| h.trim().to_ascii_lowercase()).collect();
+            let hashes = hashes
+                .split(',')
+                .map(|h| h.trim().to_ascii_lowercase())
+                .collect();
             Some((hashes, dir.into()))
         });
-    let Some((hashes, dir)) = &*WANTED else { return };
+    let Some((hashes, dir)) = &*WANTED else {
+        return;
+    };
     if !hashes.iter().any(|h| h == hash) {
         return;
     }
@@ -300,8 +305,21 @@ pub(crate) fn note_drop(this: This) {
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
+    *LAST_WHY.lock().unwrap_or_else(|e| e.into_inner()) = Some(why.clone());
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
+    *drops
+        .get_or_insert_with(HashMap::new)
+        .entry(why)
+        .or_default() += 1;
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+static LAST_WHY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The reason last given for a drop, taken (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn take_last_why() -> Option<String> {
+    LAST_WHY.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
 /// The drops counted since the last call, most first (diagnostics).
