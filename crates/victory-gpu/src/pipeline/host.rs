@@ -282,6 +282,9 @@ pub(crate) struct HostPipeline {
     pub(crate) inputs: Vec<Input>,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
+    /// A rectangle-list pipeline with a geometry shader that completes each
+    /// rectangle: its draws run three vertices per rectangle as triangles.
+    pub(crate) rect_gs: bool,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -477,6 +480,7 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                rect_gs: false,
             });
         }
         let Some(g) = g else {
@@ -509,14 +513,37 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                rect_gs: false,
             });
         }
 
+        // Rectangle lists: a geometry shader makes each rectangle's fourth
+        // corner from the vertex shader's outputs.
+        let gs = if g.topology.0 == RECTANGLES {
+            let vs = stages.first().and_then(|(s, _)| s.translated());
+            match vs.map(|t| victory_shader::emit::geometry::rect_gs(&t.host)) {
+                Some(Ok(gs)) => Some(gs),
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, ?shaders, "no rectangle geometry shader");
+                    None
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let gs_code = gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+            D3D12_SHADER_BYTECODE {
+                pShaderBytecode: gs.dxil.as_ptr().cast(),
+                BytecodeLength: gs.dxil.len(),
+            }
+        });
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
             PS: code(1),
+            GS: gs_code,
             BlendState: g.blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
@@ -541,7 +568,11 @@ impl HostPipeline {
         let name = super::library::name(
             "graphics",
             &root_blob,
-            &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+            &[
+                &code_bytes(&code(0)),
+                &code_bytes(&code(1)),
+                &code_bytes(&gs_code),
+            ],
             &state,
         );
         let made = super::library::pipeline(
@@ -579,6 +610,7 @@ impl HostPipeline {
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),
+            rect_gs: gs.is_some(),
         })
     }
 }

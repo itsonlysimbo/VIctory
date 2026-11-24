@@ -208,6 +208,11 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// The pipeline completes rectangles with a geometry shader.
+    fn rect_gs(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rect_gs)
+    }
+
     /// Counts a draw for the frame's per-depth tally (diagnostics).
     #[cfg(feature = "diagnostics")]
     pub(crate) fn tally(&self, ran: bool) {
@@ -805,7 +810,11 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let first = host.dynamic(n)?;
+            let Some(first) = host.dynamic(n) else {
+                #[cfg(all(windows, feature = "diagnostics"))]
+                crate::pipeline::note_why(format!("a table of {n} entries: no dynamic slots"));
+                return None;
+            };
             self.fresh_tables.insert(key, first);
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
@@ -920,7 +929,9 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
-        let rects = self.topology == RECTANGLES;
+        // Rectangles: completed by the pipeline's geometry shader, else
+        // expanded into vertex buffers here.
+        let rects = self.topology == RECTANGLES && !self.rect_gs();
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
         if ran {
             // Rectangles were expanded into their own vertex buffers.
@@ -1014,10 +1025,11 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
-        if self.topology == RECTANGLES {
+        let rects = self.topology == RECTANGLES && !self.rect_gs();
+        if rects {
             once!("indexed rectangles not drawn");
         }
-        let ran = self.topology != RECTANGLES && self.prepare(list, true);
+        let ran = !rects && self.prepare(list, true);
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
@@ -1103,8 +1115,13 @@ impl State {
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
+        let rects = self.topology == RECTANGLES && !self.rect_gs();
+        #[cfg(feature = "diagnostics")]
+        if matches!(kind, DRAW | INDEXED) && rects {
+            why("a rectangle list without a geometry shader");
+        }
         let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            DRAW | INDEXED => !rects && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
@@ -1117,10 +1134,17 @@ impl State {
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!(
-                    "prepare failed (compute {}, mesh {})",
-                    p.compute, p.mesh
-                )),
+                Some(p) => {
+                    // The reason given inside, if any, else a generic one.
+                    if let Some(inner) = crate::pipeline::take_last_why() {
+                        why(&inner);
+                    } else {
+                        why(&format!(
+                            "prepare failed (compute {}, mesh {}, topology {})",
+                            p.compute, p.mesh, self.topology
+                        ));
+                    }
+                }
             }
             return false;
         }

@@ -238,6 +238,7 @@ fn data_only_structured_srv_reads_its_bound_record_count() {
             outputs: &[],
             prims: &[],
             mesh: None,
+            geometry: None,
             bindings,
             threads: [1, 1, 1],
             wave_size: None,
