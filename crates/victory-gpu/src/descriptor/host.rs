@@ -209,7 +209,16 @@ impl HostHeap {
         let n = n as usize;
         let Some(first) = free_table(taken, *next as usize, n) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            ONCE.call_once(|| {
+                let (free, longest) = free_space(taken);
+                tracing::warn!(
+                    n,
+                    cap = taken.len(),
+                    free,
+                    longest,
+                    "no free dynamic descriptor slots: a table is not made"
+                );
+            });
             return None;
         };
         taken[first..first + n].fill(true);
@@ -355,6 +364,17 @@ impl HostHeap {
         }
         Some(text)
     }
+}
+
+/// Total free slots and the longest contiguous run in the physical heap.
+fn free_space(taken: &[bool]) -> (usize, usize) {
+    let mut free = 0;
+    let mut longest = 0;
+    for gap in taken.split(|&held| held) {
+        free += gap.len();
+        longest = longest.max(gap.len());
+    }
+    (free, longest)
 }
 
 /// Try each possible table start from the cursor, then from slot zero.
@@ -855,6 +875,14 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn free_space_counts_separate_runs_at_the_heap_ends() {
+        assert_eq!(free_space(&[true; 8]), (0, 0));
+        assert_eq!(free_space(&[false; 8]), (8, 8));
+        let fragmented = [false, false, true, false, true, false, false, false];
+        assert_eq!(free_space(&fragmented), (6, 3));
+    }
 
     #[test]
     fn free_table_chooses_the_first_contiguous_fit_in_cursor_order() {
