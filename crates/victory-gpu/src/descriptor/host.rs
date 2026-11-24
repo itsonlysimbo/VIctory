@@ -47,7 +47,7 @@ struct StrideTable {
 
 impl StrideTable {
     fn new(device: &ID3D12Device, len: u32) -> Option<Self> {
-        // Two dwords a slot: [`SLOT_DWORDS`].
+        // [`SLOT_DWORDS`] dwords a slot.
         let bytes = (u64::from(len) * 4 * SLOT_DWORDS).max(4);
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -382,7 +382,7 @@ impl HostHeap {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
-        self.set_slot(index, if ok { slot_words(view) } else { [0; 4] });
+        self.set_slot(index, if ok { slot_words(view) } else { [0; SLOT_DWORDS as usize] });
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -393,7 +393,7 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
-        self.set_slot(index, [0; 4]);
+        self.set_slot(index, [0; SLOT_DWORDS as usize]);
     }
 
     /// Makes slot `index` a null view matching the resource kind a shader
@@ -457,7 +457,7 @@ impl HostHeap {
 
     /// Slot `index`'s words in the table: its element stride and the
     /// NUM_RECORDS its console descriptor holds ([`slot_words`]).
-    fn set_slot(&self, index: u32, words: [u32; 4]) {
+    fn set_slot(&self, index: u32, words: [u32; SLOT_DWORDS as usize]) {
         if let Some(t) = &self.strides
             && index < t.len
         {
@@ -481,7 +481,7 @@ impl HostHeap {
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
-        self.set_slot(index, [0; 4]);
+        self.set_slot(index, [0; SLOT_DWORDS as usize]);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
@@ -547,7 +547,7 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
-            self.set_slot(index, if ok { slot_words(&view) } else { [0; 4] });
+            self.set_slot(index, if ok { slot_words(&view) } else { [0; SLOT_DWORDS as usize] });
         }
         Some(view)
     }
@@ -719,8 +719,60 @@ fn view_stride(view: &View) -> u32 {
 const SLOT_DWORDS: u64 = victory_shader::emit::SLOT_TABLE_DWORDS as u64;
 
 /// A slot's words in the runtime table.
-fn slot_words(view: &View) -> [u32; 4] {
-    [view_stride(view), view_records(view), view_dword1(view), 0]
+fn slot_words(view: &View) -> [u32; SLOT_DWORDS as usize] {
+    let mut w = [0; SLOT_DWORDS as usize];
+    w[..4].copy_from_slice(&[view_stride(view), view_records(view), view_dword1(view), 0]);
+    let at = victory_shader::emit::SLOT_CONSOLE_WORDS as usize;
+    w[at..at + 8].copy_from_slice(&console_words(view));
+    w
+}
+
+/// The console descriptor (GFX10 V# or T#, eight dwords) the title would
+/// hold for `view`, as far as the host view tells it: a buffer's title
+/// address, stride field, NUM_RECORDS and identity channel order; an
+/// image's title address (views of placed memory only) and its type.
+/// Code that reads a descriptor's fields as data (XCL's model: console
+/// descriptors are memory shaders read) gets these.
+// shortcut: formats, tiling, sizes of images and the metadata words read
+// 0; the translator rebuilds image sizes from the host view itself.
+fn console_words(view: &View) -> [u32; 8] {
+    /// DST_SEL x, y, z, w = X, Y, Z, W (dword 3 bits 0..11).
+    const IDENTITY: u32 = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    let buffer = |address: u64, records: u32, dword1: u32| {
+        [
+            address as u32,
+            (address >> 32) as u32 & 0xFFFF | dword1 & 0x3FFF_0000,
+            records,
+            IDENTITY,
+            0,
+            0,
+            0,
+            0,
+        ]
+    };
+    match view {
+        View::Constant(address, size) => buffer(*address, *size, 0),
+        View::Shader(..) | View::Unordered(..) | View::Placed(..)
+            if view_records(view) != 0 =>
+        {
+            let address = buffer_range(view).map_or(0, |(a, _)| a);
+            buffer(address, view_records(view), view_dword1(view))
+        }
+        View::Placed(_, _, desc) => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            [
+                (address >> 8) as u32,
+                (address >> 40) as u32 & 0xFF,
+                0,
+                IDENTITY,
+                0,
+                0,
+                0,
+                0,
+            ]
+        }
+        _ => [0; 8],
+    }
 }
 
 /// Dword 1 of the buffer descriptor the console holds for `view`, its

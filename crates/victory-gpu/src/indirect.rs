@@ -6,7 +6,7 @@
 //! just before its execution, by a compute shader of ours (HLSL compiled by
 //! the system's compiler; a 5.1 shader with its root signature inside).
 //!
-//! Each list also has a budget (2^27 vertex instances or threads, groups
+//! Each list also has a budget (2^25 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
 //! so a list of thousands of garbage records cannot run for seconds
 //! either.
@@ -33,7 +33,9 @@ RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
+// 2^25, not 2^27: one list of indirect mesh draws whose counts a dropped
+// pass left stale ran past the host's 2 s limit on an RTX 4070.
+static const uint BUDGET = 1u << 25;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 [RootSignature(RS)]
@@ -57,9 +59,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 64;
         args.Store3(at, g);
     } else {
-        // Mesh dispatches: the console's are one-dimensional.
+        // Mesh dispatches: the console's are one-dimensional. 2^14 groups at
+        // most: a stale count of 65,535 groups hung the host GPU in one draw.
         uint3 g = args.Load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        g = uint3(min(g.x, 1u << 14), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
     }

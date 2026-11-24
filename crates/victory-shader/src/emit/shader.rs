@@ -17,8 +17,14 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const STRIDE_SPACE: u32 = 2;
 /// Dwords per view-heap slot in that table: the element stride, the
 /// console descriptor's NUM_RECORDS (its dword 2), its dword 1 with only the
-/// stride field (bits 16..30) set, and a word kept for its dword 3.
-pub const SLOT_TABLE_DWORDS: u32 = 4;
+/// stride field (bits 16..30) set, and a word kept for its dword 3; then,
+/// from [`SLOT_CONSOLE_WORDS`], the eight dwords of the console descriptor
+/// rebuilt from the host view (addresses are title addresses), which code
+/// that reads a descriptor's other fields as data gets.
+pub const SLOT_TABLE_DWORDS: u32 = 12;
+
+/// Where the rebuilt console descriptor starts in a slot of the table.
+pub const SLOT_CONSOLE_WORDS: u32 = 4;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

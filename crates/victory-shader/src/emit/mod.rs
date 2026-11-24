@@ -106,7 +106,10 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_TABLE_DWORDS, STRIDE_SPACE, USER_DATA_SPACE};
+pub use shader::{
+    ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_CONSOLE_WORDS, SLOT_TABLE_DWORDS, STRIDE_SPACE,
+    USER_DATA_SPACE,
+};
 
 /// The loop limit without an override: 2^12.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -1148,8 +1151,9 @@ mod tests {
                                 super::host::Root::View {
                                     srv: true,
                                     // Two slots: stride, NUM_RECORDS,
-                                    // dword 1, dword 3.
-                                    data: vec![12, 0, 0, 0, 12, 0, 0, 0],
+                                    // dword 1, dword 3, then the eight
+                                    // console descriptor words.
+                                    data: [[12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; 2].concat(),
                                 },
                             ),
                         ],
@@ -1293,7 +1297,12 @@ mod tests {
                                     // Slot 0: no stride, 77 records; slot 1
                                     // (the output): 4-byte elements; the
                                     // guard slot: nothing.
-                                    data: vec![0, 77, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0],
+                                    data: [
+                                        [0, 77, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                                        [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                                        [0; 12],
+                                    ]
+                                    .concat(),
                                 },
                             ),
                         ],

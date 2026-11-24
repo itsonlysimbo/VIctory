@@ -3507,16 +3507,27 @@ impl<'a> Lower<'a> {
             }
             None => vec![(2, field(self, 0))],
         };
+        // The other dwords (addresses, formats, tiling) come from the console
+        // descriptor the host rebuilt in the runtime table (XCL's model:
+        // descriptors are memory shaders read); a descriptor in no heap slot
+        // reads them as 0.
+        let slot = self.heap_slot(&src, false).ok();
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
-            match words.iter().find(|w| w.0 == rel) {
-                Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
+            let x = match words.iter().find(|w| w.0 == rel) {
+                Some(&(_, x)) => x,
+                None if rel < 8 => match slot {
+                    Some(slot) => self.slot_table_word(slot, super::SLOT_CONSOLE_WORDS + rel),
+                    None => self.s.m.i32(0),
+                },
                 None => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
                         self.vals.insert(v, Val::Missing(OTHER));
                     }
+                    continue;
                 }
-            }
+            };
+            self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
     }
@@ -3541,9 +3552,7 @@ impl<'a> Lower<'a> {
         // Every loaded dword's place in its slot; the slot is that of the
         // first (`heap_slot` divides the address by the slot size).
         let words: Vec<u32> = (0..count).map(|k| at + 4 * k).collect();
-        if words.last().is_some_and(|&w| w >= slot_bytes)
-            || !words.iter().any(|w| matches!(w, 4 | 8))
-        {
+        if words.last().is_some_and(|&w| w >= slot_bytes) {
             return Err(WHY);
         }
         let src = Source::Loaded { load: site, first: 0 };
@@ -3556,6 +3565,11 @@ impl<'a> Lower<'a> {
                 _ => None,
             };
             if let Some(w) = table_word {
+                let x = self.slot_table_word(slot, w);
+                self.write(inst, reg, x, None);
+            } else if words[k as usize] < slot_bytes {
+                // The rebuilt console descriptor's dword there.
+                let w = super::SLOT_CONSOLE_WORDS + words[k as usize] / 4;
                 let x = self.slot_table_word(slot, w);
                 self.write(inst, reg, x, None);
             } else if let Some(v) = inst.write(reg) {
@@ -6438,6 +6452,29 @@ impl<'a> Lower<'a> {
                 fu
             };
             match op {
+                // Implicit derivatives outside pixel shaders: the host
+                // validator refuses `sample`/`sampleBias` in compute and mesh
+                // shaders, so these sample level 0 (plus the bias) instead.
+                // shortcut: the console takes the level from quads of lanes;
+                // a pass that relies on that gets level 0's texels.
+                60 | 61 if !self.s.pixel => {
+                    let lod = if op == 61 {
+                        let bias = addr_u32(self, usize::from(offset_word))?;
+                        self.as_float(bias)
+                    } else {
+                        self.s.m.f32(0)
+                    };
+                    args.extend(&os);
+                    args.push(lod);
+                    self.s.op(
+                        c,
+                        "sampleLevel.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        62,
+                        &args,
+                    )
+                }
                 60 => {
                     args.extend(&os);
                     args.push(clamp);
