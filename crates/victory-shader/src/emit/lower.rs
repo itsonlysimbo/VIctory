@@ -362,22 +362,63 @@ impl<'a> Lower<'a> {
                     LaneExit::Branch { when, .. } => Some(when),
                     _ => None,
                 });
-                let mut all: Vec<Bool> =
+                let selects = insts().filter_map(|i| {
+                    let Fields::Valu(v) = &i.fields else {
+                        return None;
+                    };
+                    if !matches!(
+                        i.name(),
+                        "v_cndmask_b32"
+                            | "v_add_co_ci_u32"
+                            | "v_sub_co_ci_u32"
+                            | "v_subrev_co_ci_u32"
+                    ) {
+                        return None;
+                    }
+                    let &Operand::Scalar { code, .. } = v.src.get(2)? else {
+                        return None;
+                    };
+                    if code == NULL {
+                        return None;
+                    }
+                    let m = i.read(Reg::S(code))?;
+                    x.st.masks.get(&m).copied()
+                });
+                let mut seen_bools = HashSet::new();
+                let mut seen_phis = HashSet::new();
+                let mut work: Vec<Bool> =
                     x.st.guards
                         .iter()
                         .flatten()
                         .flatten()
                         .copied()
                         .chain(whens)
+                        .chain(selects)
                         .collect();
-                all.sort_unstable();
-                all.dedup();
-                all.into_iter().any(|g| {
-                    x.st.bools
-                        .support(g)
-                        .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
-                })
+                let mut needs_console = false;
+                while let Some(g) = work.pop() {
+                    if !seen_bools.insert(g) {
+                        continue;
+                    }
+                    for a in x.st.bools.support(g) {
+                        match a {
+                            Atom::Opaque(_) | Atom::Constant(_) => {
+                                needs_console = true;
+                                break;
+                            }
+                            Atom::Phi(id) if seen_phis.insert(id) => {
+                                if let Some(edges) = x.st.phi_masks.get(&id) {
+                                    work.extend(edges.iter().copied());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if needs_console {
+                        break;
+                    }
+                }
+                needs_console
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
@@ -1583,6 +1624,7 @@ impl<'a> Lower<'a> {
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
+        self.s.flags |= flags::WAVE_OPS;
         let lane = self.s.op(
             at,
             "waveGetLaneIndex",
@@ -6508,6 +6550,26 @@ impl<'a> Lower<'a> {
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
+        while let Some((v, b, i)) = self.pending_masks.pop() {
+            let phi = &p.blocks[b].phis[i];
+            let offset = p.blocks[b].offset;
+            let args = self
+                .x
+                .st
+                .phi_masks
+                .get(&phi.value)
+                .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
+            let mut incoming = Vec::new();
+            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                let Some(qb) = self.tail[q] else { continue };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let x = self
+                    .boolean(args[n], qb)
+                    .map_err(|w| unsupported(offset, w))?;
+                incoming.push((x, qb));
+            }
+            self.s.m.set_phi(v, incoming);
+        }
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
@@ -6537,22 +6599,6 @@ impl<'a> Lower<'a> {
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
         }
-        while let Some((v, b, i)) = self.pending_masks.pop() {
-            let phi = &p.blocks[b].phis[i];
-            let offset = p.blocks[b].offset;
-            let mut incoming = Vec::new();
-            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
-                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
-                incoming.push((x, qb));
-            }
-            self.s.m.set_phi(v, incoming);
-        }
         Ok(())
     }
 }
@@ -6567,20 +6613,41 @@ mod tests {
 
     /// Lowers a compute program of constants: whether it translates.
     fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
+        lowers_cs(words, false, 0).map(|_| ())
+    }
+
+    fn lowers_cs(
+        words: &[u32],
+        wave64: bool,
+        const_sgprs: u8,
+    ) -> Result<super::Lowered, crate::ShaderError> {
+        use crate::native::{RootParam, RootType};
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let layout = if const_sgprs > 0 {
+            vec![RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: u32::from(const_sgprs),
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }]
+        } else {
+            vec![]
+        };
         let native = NativeProgram {
             stage: HwStage::Cs,
-            wave64: false,
+            wave64,
             vgprs: 256,
-            layout: vec![],
+            layout,
             used: vec![],
             io: StageIo::Cs(ComputeIo {
-                rsrc2: 0,
-                threads: [1, 1, 1],
+                rsrc2: u32::from(const_sgprs) << 1,
+                threads: [if wave64 { 64 } else { 32 }, 1, 1],
             }),
             code,
         };
-        let p = ir::build(&native.code, false, 256).unwrap();
+        let p = ir::build(&native.code, wave64, 256).unwrap();
         let res = resource::track(&p, &native.layout, native.stage).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
@@ -6595,7 +6662,64 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
+    }
+
+    #[test]
+    fn lane_mask_phi_joining_zero_and_compare_lowers() {
+        let cnd = 0x81 | (0x82 << 9) | (2 << 18); // v_cndmask_b32 v1, 1, 2, s2
+        let words = [
+            0xBF06_8000, // 0: s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // 4: s_cbranch_scc1 -> 16
+            0xBE82_0380, // 8: s_mov_b32 s2, 0
+            0xBF82_0002, // 12: s_branch -> 24
+            0xD4C2_0002,
+            0x0002_0080, // 16: v_cmp_eq_u32 s2, 0, v0
+            0xD501_0001,
+            cnd, // 24: v_cndmask_b32 v1, 1, 2, s2
+            S_ENDPGM,
+        ];
+        lowers_cs(&words, false, 1).unwrap();
+    }
+
+    #[test]
+    fn wave64_loop_mask_accumulator_from_zero_lowers() {
+        let cnd = 0x81 | (0x82 << 9) | (2 << 18); // v_cndmask_b32 v1, 1, 2, s[2:3]
+        let words = [
+            0xBE82_0480, // 0: s_mov_b64 s[2:3], 0
+            0xBE84_0380, // 4: s_mov_b32 s4, 0
+            0xD501_0001,
+            cnd,         // 8: v_cndmask_b32 v1, 1, 2, s[2:3]
+            0x7D84_0080, // 16: v_cmp_eq_u32 vcc, 0, v0
+            0x8882_026A, // 20: s_or_b64 s[2:3], vcc, s[2:3]
+            0x8004_8104, // 24: s_add_u32 s4, s4, 1
+            0xBF0A_8404, // 28: s_cmp_lt_u32 s4, 4
+            0xBF85_FFF9, // 32: s_cbranch_scc1 -> 8
+            0xD501_0004,
+            cnd, // 36: v_cndmask_b32 v4, 1, 2, s[2:3]
+            S_ENDPGM,
+        ];
+        lowers_cs(&words, true, 0).unwrap();
+    }
+
+    #[test]
+    fn lane_mask_phi_with_partial_constant_enables_console_lanes() {
+        let cnd = 0x81 | (0x82 << 9) | (2 << 18); // v_cndmask_b32 v1, 1, 2, s2
+        let words = [
+            0xBF06_8000, // 0: s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // 4: s_cbranch_scc1 -> 16
+            0xBE82_038F, // 8: s_mov_b32 s2, 15 (partial constant mask 0xF)
+            0xBF82_0002, // 12: s_branch -> 24
+            0xD4C2_0002,
+            0x0002_0080, // 16: v_cmp_eq_u32 s2, 0, v0
+            0xD501_0001,
+            cnd, // 24: v_cndmask_b32 v1, 1, 2, s2
+            S_ENDPGM,
+        ];
+        let lowered = lowers_cs(&words, false, 1).unwrap();
+        assert!(
+            !lowered.dxil.is_empty(),
+            "expected DXIL with WaveSize(32) and WAVE_OPS"
+        );
     }
 
     #[test]
