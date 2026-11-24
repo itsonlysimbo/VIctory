@@ -91,7 +91,7 @@ fn valu_program(body: &[u32]) -> NativeProgram {
 /// Lowers `words` as a 1-thread compute program with [`build_valu_cs`]'s
 /// layout: 4 root constants in `s0..s3`, the address of a table holding a
 /// UAV in `s4`.
-fn lower_cs(words: &[u32]) -> HostShader {
+fn lower_cs(words: &[u32]) -> NativeProgram {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     NativeProgram {
         stage: HwStage::Cs,
@@ -763,7 +763,7 @@ fn a_heap_index_past_the_heap_reads_the_guard_slot() {
         buffer_store_dword(0, 8, 0)[1],
         S_ENDPGM,
     ];
-    let shader = lower_cs(&words);
+    let shader = lower_test_shader(&lower_cs(&words), &[]);
     // The guard is a user-data dword of its own, past the console's.
     let guard: Vec<_> = shader
         .user_data
