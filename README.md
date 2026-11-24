@@ -1,5 +1,12 @@
 # VIctory
 
+> **Unofficial fork** of [Marvisak/VIctory](https://github.com/Marvisak/VIctory),
+> modified for GPUs without 64-lane waves (NVIDIA). Branch `nvidia-32-lane`:
+> build guide, status, legal notes and the list of changes in
+> [docs/nvidia-32-lane-guide.md](docs/nvidia-32-lane-guide.md). No game files
+> are included; you need your own copy. Not affiliated with the game's publisher
+> or Microsoft.
+
 Runs a console title (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 
