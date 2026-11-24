@@ -3453,7 +3453,25 @@ impl<'a> Lower<'a> {
                 };
                 ((12 | u, binding.stride), None)
             }
-            _ => return Err("a scalar memory read as data"),
+            // Other uses (scalar buffer loads through it, say): every dword
+            // from the console descriptor the host rebuilt in the runtime
+            // table, when the descriptor is in a heap slot.
+            _ => {
+                let slot = self
+                    .heap_slot(&src, false)
+                    .map_err(|_| "a scalar memory read as data")?;
+                for k in 0..count {
+                    let rel = k.wrapping_sub(u32::from(first));
+                    let reg = Reg::S(code + k as u8);
+                    if rel < 8 {
+                        let x = self.slot_table_word(slot, super::SLOT_CONSOLE_WORDS + rel);
+                        self.write(inst, reg, x, None);
+                    } else if let Some(v) = inst.write(reg) {
+                        self.vals.insert(v, Val::Missing(OTHER));
+                    }
+                }
+                return Ok(());
+            }
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
