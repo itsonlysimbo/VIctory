@@ -307,7 +307,7 @@ fn log_draws(frame: u64) {
         );
         let mut why: Vec<_> = why.into_iter().collect();
         why.sort_by_key(|w| std::cmp::Reverse(w.1));
-        for (w, n) in why.into_iter().take(8) {
+        for (w, n) in why.into_iter().take(if depth == usize::MAX - 1 { 64 } else { 8 }) {
             tracing::info!(
                 frame,
                 depth = format_args!("{depth:#x}"),

@@ -325,10 +325,13 @@ fn translate(
     t: &mut Tally,
     checks: &mut Checks,
 ) {
-    let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
+        let example = || format!("{}{}", path.display(), source.label());
         return t.fail("corrupt record".into(), example);
     };
+    // The runtime's name for the container (`pipeline::shader`'s hash).
+    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+    let example = || format!("{}{} [{hash}]", path.display(), source.label());
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);

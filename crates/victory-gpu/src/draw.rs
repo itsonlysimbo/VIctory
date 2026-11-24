@@ -57,7 +57,7 @@ pub(crate) struct IndexView {
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
-    pipeline: usize,
+    pub(crate) pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
     graphics: Vec<Root>,
@@ -596,12 +596,21 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        let ran = self.dispatch_inner(list, x, y, z);
+        // diagnostics: dispatches tally under a depth of all ones but one.
+        #[cfg(feature = "diagnostics")]
+        crate::capture::note_draw(usize::MAX - 1, 0, ran, self.pipeline);
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = ran;
+    }
+
+    fn dispatch_inner(&mut self, list: &HostList, x: u32, y: u32, z: u32) -> bool {
         #[cfg(windows)]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
-            return;
+            return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
@@ -611,15 +620,15 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
-            return;
+            return false;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
-            return;
+            return false;
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            return;
+            return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
@@ -627,6 +636,7 @@ impl State {
         unsafe { list.list.Dispatch(x, y, z) };
         serialize(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// What a draw or dispatch runs, for the device-removed report

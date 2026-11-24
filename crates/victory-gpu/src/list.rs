@@ -1195,6 +1195,8 @@ extern "system" fn execute_indirect(
             #[cfg(all(windows, feature = "diagnostics"))]
             if kind != DISPATCH {
                 s.tally(ran);
+            } else {
+                crate::capture::note_draw(usize::MAX - 1, 0, ran, s.pipeline);
             }
         });
     } else {
