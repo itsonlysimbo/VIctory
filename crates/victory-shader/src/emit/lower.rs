@@ -1090,8 +1090,14 @@ impl<'a> Lower<'a> {
             return Some(why);
         }
         let p = x.p;
-        if p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name().contains("permute")) {
-            return Some("a lane mask holding lanes elsewhere read as data, in a program with ds_permute");
+        if p.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| i.name().contains("permute"))
+        {
+            return Some(
+                "a lane mask holding lanes elsewhere read as data, in a program with ds_permute",
+            );
         }
         // Whole-wave sections lower to wave operations over the host's
         // active lanes, each lane's input its own unless its bit of the
@@ -1103,13 +1109,17 @@ impl<'a> Lower<'a> {
             return None;
         }
         if !(0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty()) {
-            return Some("a lane mask holding lanes elsewhere read as data, in a wave64 program with whole-wave sections on a host without 64-lane waves");
+            return Some(
+                "a lane mask holding lanes elsewhere read as data, in a wave64 program with whole-wave sections on a host without 64-lane waves",
+            );
         }
         if !x.native.wave64 || !x.target.runs(32) {
             return Some(ELSEWHERE);
         }
         if cs.threads.iter().product::<u32>() > 64 {
-            return Some("a lane mask holding lanes elsewhere read as data, in a wave64 group of more than 64 threads on a host without 64-lane waves");
+            return Some(
+                "a lane mask holding lanes elsewhere read as data, in a wave64 group of more than 64 threads on a host without 64-lane waves",
+            );
         }
         None
     }
@@ -3573,7 +3583,10 @@ impl<'a> Lower<'a> {
         if words.last().is_some_and(|&w| w >= slot_bytes) {
             return Err(WHY);
         }
-        let src = Source::Loaded { load: site, first: 0 };
+        let src = Source::Loaded {
+            load: site,
+            first: 0,
+        };
         let slot = self.heap_slot(&src, false).map_err(|_| WHY)?;
         for k in 0..count {
             let reg = Reg::S(code + k as u8);
@@ -3591,7 +3604,10 @@ impl<'a> Lower<'a> {
                 let x = self.slot_table_word(slot, w);
                 self.write(inst, reg, x, None);
             } else if let Some(v) = inst.write(reg) {
-                self.vals.insert(v, Val::Missing("a descriptor's address or format read as data"));
+                self.vals.insert(
+                    v,
+                    Val::Missing("a descriptor's address or format read as data"),
+                );
             }
         }
         Ok(())
@@ -6385,12 +6401,10 @@ impl<'a> Lower<'a> {
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
+            // Cube gradients are in face space: s and t only.
+            let derivs = if kind == 5 { 2 } else { spatial };
             let deriv_regs = if op == 63 {
-                if *a16 {
-                    spatial.div_ceil(2)
-                } else {
-                    spatial
-                }
+                if *a16 { derivs.div_ceil(2) } else { derivs }
             } else {
                 0
             };
@@ -6405,13 +6419,14 @@ impl<'a> Lower<'a> {
                     l.as_float(x)
                 }
             };
-            if kind == 5 && (*unorm || op == 63 || op == 81) {
-                return Err("a cube sample with texel coordinates, gradients or a level query");
+            if kind == 5 && *unorm {
+                return Err("a cube sample with texel coordinates");
             }
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
                 let x = addr_packed(self, coord_base, k)?;
                 *slot = to_float(self, x);
             }
+            let face = cs[2];
             if kind == 5 {
                 let dir = self.cube_direction(cs[0], cs[1], cs[2]);
                 cs[..3].copy_from_slice(&dir);
@@ -6515,11 +6530,17 @@ impl<'a> Lower<'a> {
                 }
                 63 => {
                     let mut g = vec![fu; 6];
-                    for k in 0..spatial {
+                    for k in 0..derivs {
                         let x = addr_packed(self, first, k)?;
                         g[k] = to_float(self, x);
                         let y = addr_packed(self, first + deriv_regs, k)?;
                         g[3 + k] = to_float(self, y);
+                    }
+                    if kind == 5 {
+                        let gx = self.cube_gradient(g[0], g[1], face);
+                        let gy = self.cube_gradient(g[3], g[4], face);
+                        g[..3].copy_from_slice(&gx);
+                        g[3..].copy_from_slice(&gy);
                     }
                     args.extend(&os);
                     args.extend(g);
@@ -6687,6 +6708,38 @@ impl<'a> Lower<'a> {
             [one, mone, u, u, u, nu],
             [nv, nv, one, mone, nv, nv],
             [nu, u, v, nv, one, mone],
+        ];
+        table.map(|row| {
+            let mut r = row[0];
+            for (n, &x) in row.iter().enumerate().skip(1) {
+                let kn = self.s.m.i32(n as u32);
+                let is = self.s.m.cmp(c, pred::EQ, f, kn);
+                r = self.s.m.select(c, is, x, r);
+            }
+            r
+        })
+    }
+
+    /// A gradient of face coordinates (s, t) as the gradient of
+    /// [`Self::cube_direction`]'s direction: the same per-face mapping
+    /// without its constant terms (the major axis stays ±1).
+    fn cube_gradient(&mut self, ds: V, dt: V, face: V) -> [V; 3] {
+        let c = self.cur;
+        let two = self.s.m.f32(2.0f32.to_bits());
+        let du = self.s.m.bin(c, Bin::Mul, ds, two);
+        let dv = self.s.m.bin(c, Bin::Mul, dt, two);
+        let z = self.s.m.f32(0x8000_0000);
+        let (ndu, ndv) = (
+            self.s.m.bin(c, Bin::Sub, z, du),
+            self.s.m.bin(c, Bin::Sub, z, dv),
+        );
+        let zero = self.s.m.f32(0);
+        let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
+        // Per face +x, -x, +y, -y, +z, -z, as in `cube_direction`.
+        let table = [
+            [zero, zero, du, du, du, ndu],
+            [ndv, ndv, zero, zero, ndv, ndv],
+            [ndu, du, dv, ndv, zero, zero],
         ];
         table.map(|row| {
             let mut r = row[0];
@@ -7706,7 +7759,9 @@ impl<'a> Lower<'a> {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
             let mut incoming = Vec::new();
-            if !self.console_cf && let Some(args) = self.x.st.phi_masks.get(&phi.value) {
+            if !self.console_cf
+                && let Some(args) = self.x.st.phi_masks.get(&phi.value)
+            {
                 for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                     let Some(qb) = self.tail[q] else { continue };
                     let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
@@ -7723,10 +7778,9 @@ impl<'a> Lower<'a> {
                     // also takes masks that are constants or built from scalars.
                     let arg = &phi.args[n];
                     let others = self.console_cf.then(|| self.x.st.others.get(arg)).flatten();
-                    let m =
-                        *self.x.st.masks.get(arg).or(others).ok_or_else(|| {
-                            unsupported(offset, "a lane-mask join of an untracked mask")
-                        })?;
+                    let m = *self.x.st.masks.get(arg).or(others).ok_or_else(|| {
+                        unsupported(offset, "a lane-mask join of an untracked mask")
+                    })?;
                     let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
                     incoming.push((x, qb));
                 }
