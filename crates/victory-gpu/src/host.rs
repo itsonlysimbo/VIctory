@@ -31,6 +31,38 @@ pub(crate) fn texture_state(state: u32) -> u32 {
     pc_state(state) & !BUFFER_ONLY
 }
 
+/// The host state of a buffer copy that shaders write (unordered access).
+/// The other states a buffer copy takes are read states, which combine.
+pub(crate) const BUFFER_UAV: u32 = 0x8;
+/// The host states a buffer copy is read in: vertex or constant data, index
+/// data, shader resource (both stages), indirect arguments.
+pub(crate) const BUFFER_VERTEX_CONSTANT: u32 = 0x1;
+pub(crate) const BUFFER_INDEX: u32 = 0x2;
+pub(crate) const BUFFER_SHADER_RESOURCE: u32 = 0x40 | 0x80;
+pub(crate) const BUFFER_INDIRECT: u32 = 0x200;
+
+/// What a buffer copy in `before` is moved to for a use in `wanted`: the
+/// read states combine, so a copy read as vertex data and then as a shader
+/// resource is in both; unordered access excludes every other state, and
+/// the common state (0) is left implicitly, by the use itself.
+pub(crate) fn buffer_after(before: u32, wanted: u32) -> u32 {
+    if before == 0 || (before | wanted) & BUFFER_UAV != 0 {
+        wanted
+    } else {
+        before | wanted
+    }
+}
+
+/// The one state for uses of a buffer copy by the same draw or dispatch:
+/// unordered access if any is, else the read states together.
+pub(crate) fn buffer_together(a: u32, b: u32) -> u32 {
+    if (a | b) & BUFFER_UAV != 0 {
+        BUFFER_UAV
+    } else {
+        a | b
+    }
+}
+
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
@@ -292,6 +324,18 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// The host state each buffer copy (`shadow`) the list uses is in at this
+    /// point of its commands; a copy not here is in the common state. Every
+    /// list starts with its copies there and ends with them there (`close`),
+    /// so what an earlier list of the same submission did to a copy does not
+    /// matter, whatever order lists were recorded in: a copy a compute pass
+    /// wrote (unordered access) and a later list draws from (vertex data)
+    /// would otherwise reach the draw in the wrong state. Holding the copies
+    /// keeps them alive until the list is reset.
+    buffers: Mutex<Buffers>,
+    /// The copies and states the draw or dispatch being recorded uses, until
+    /// `settle_buffers` moves them there together.
+    wanted: Mutex<Vec<(std::sync::Arc<crate::shadow::Shadow>, u32)>>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -321,6 +365,9 @@ type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
+
+/// Buffer copies by address: their host state and the copy.
+type Buffers = std::collections::HashMap<usize, (u32, std::sync::Arc<crate::shadow::Shadow>)>;
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -476,6 +523,8 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                buffers: Mutex::default(),
+                wanted: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -858,6 +907,27 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // Buffer copies end in the common state, where every list starts
+        // them (`buffers`).
+        self.wanted.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+            let mut common: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+            for (state, shadow) in buffers.values_mut() {
+                if *state != 0 {
+                    common.push(transition(
+                        &shadow.buffer,
+                        D3D12_RESOURCE_STATES(*state as i32),
+                        D3D12_RESOURCE_STATE_COMMON,
+                    ));
+                    *state = 0;
+                }
+            }
+            if !common.is_empty() {
+                // SAFETY: an open list; the list still holds the copies.
+                unsafe { self.list.ResourceBarrier(&common) };
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -880,6 +950,8 @@ impl HostList {
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.buffers.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.wanted.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -958,6 +1030,67 @@ impl HostList {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
         list.cast().ok()
+    }
+
+    /// Moves the host copy `shadow` of a title buffer to a state it can be
+    /// used in as `wanted` (the `BUFFER_` states) in this list, if it is not
+    /// in one: the copy is also written by shaders (unordered access), which
+    /// no read state allows, so a draw that takes vertices a compute pass
+    /// wrote needs the move. The list's first use of a copy records nothing:
+    /// from the common state, the use itself moves it.
+    pub(crate) fn buffer_state(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, wanted: u32) {
+        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let before = buffers.get(&key).map_or(0, |b| b.0);
+        let after = buffer_after(before, wanted);
+        if after == before {
+            return;
+        }
+        buffers.insert(key, (after, shadow.clone()));
+        if before != 0 {
+            // SAFETY: an open list; the list holds the copy.
+            unsafe {
+                self.list.ResourceBarrier(&[transition(
+                    &shadow.buffer,
+                    D3D12_RESOURCE_STATES(before as i32),
+                    D3D12_RESOURCE_STATES(after as i32),
+                )])
+            };
+        }
+    }
+
+    /// Notes that commands already recorded left `shadow` in `state`.
+    pub(crate) fn set_buffer_state(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, state: u32) {
+        self.buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(std::sync::Arc::as_ptr(shadow) as usize, (state, shadow.clone()));
+    }
+
+    /// The draw or dispatch being recorded uses `shadow` as `state` (a
+    /// `BUFFER_` state); `settle_buffers` makes it so once they are all named.
+    pub(crate) fn want_buffer(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, state: u32) {
+        self.wanted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((shadow.clone(), state));
+    }
+
+    /// Moves every copy named by `want_buffer` since the last call to the
+    /// one state its uses allow together (views of one buffer that a shader
+    /// reads and writes at once are in unordered access).
+    pub(crate) fn settle_buffers(&self) {
+        let wanted = std::mem::take(&mut *self.wanted.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut settled: Vec<(std::sync::Arc<crate::shadow::Shadow>, u32)> = Vec::new();
+        for (shadow, state) in wanted {
+            match settled.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, &shadow)) {
+                Some((_, all)) => *all = buffer_together(*all, state),
+                None => settled.push((shadow, state)),
+            }
+        }
+        for (shadow, state) in &settled {
+            self.buffer_state(shadow, *state);
+        }
     }
 
     /// Notes what the command about to be recorded does, as a marker
@@ -2040,6 +2173,59 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
              before {n_before} hashes in {before:?}, after {n_after} in {after:?} ({:.1}x)",
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
+        );
+    }
+}
+
+#[cfg(test)]
+mod buffer_states {
+    use super::{
+        BUFFER_INDEX, BUFFER_INDIRECT, BUFFER_SHADER_RESOURCE, BUFFER_UAV,
+        BUFFER_VERTEX_CONSTANT, buffer_after, buffer_together,
+    };
+
+    /// The failing submission: a compute pass writes a buffer copy through
+    /// unordered access and a draw then takes vertices from it.
+    #[test]
+    fn vertex_data_a_pass_wrote_is_moved_out_of_unordered_access() {
+        let after = buffer_after(BUFFER_UAV, BUFFER_VERTEX_CONSTANT);
+        assert_eq!(after, BUFFER_VERTEX_CONSTANT);
+        assert_eq!(after & BUFFER_UAV, 0);
+    }
+
+    #[test]
+    fn the_first_use_names_its_own_state() {
+        for state in [BUFFER_VERTEX_CONSTANT, BUFFER_INDEX, BUFFER_SHADER_RESOURCE, BUFFER_UAV] {
+            assert_eq!(buffer_after(0, state), state);
+        }
+    }
+
+    #[test]
+    fn read_states_combine() {
+        let both = buffer_after(BUFFER_VERTEX_CONSTANT, BUFFER_INDEX);
+        assert_eq!(both, BUFFER_VERTEX_CONSTANT | BUFFER_INDEX);
+        // Already covered: nothing to move.
+        assert_eq!(buffer_after(both, BUFFER_INDEX), both);
+        assert_eq!(
+            buffer_after(both, BUFFER_SHADER_RESOURCE),
+            BUFFER_VERTEX_CONSTANT | BUFFER_INDEX | BUFFER_SHADER_RESOURCE
+        );
+    }
+
+    #[test]
+    fn unordered_access_excludes_the_read_states() {
+        let reads = BUFFER_VERTEX_CONSTANT | BUFFER_INDIRECT;
+        assert_eq!(buffer_after(reads, BUFFER_UAV), BUFFER_UAV);
+        assert_eq!(buffer_after(BUFFER_UAV, BUFFER_UAV), BUFFER_UAV);
+    }
+
+    #[test]
+    fn one_dispatch_that_reads_and_writes_a_buffer_gets_unordered_access() {
+        assert_eq!(buffer_together(BUFFER_SHADER_RESOURCE, BUFFER_UAV), BUFFER_UAV);
+        assert_eq!(buffer_together(BUFFER_UAV, BUFFER_SHADER_RESOURCE), BUFFER_UAV);
+        assert_eq!(
+            buffer_together(BUFFER_SHADER_RESOURCE, BUFFER_VERTEX_CONSTANT),
+            BUFFER_SHADER_RESOURCE | BUFFER_VERTEX_CONSTANT
         );
     }
 }
