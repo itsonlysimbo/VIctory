@@ -135,7 +135,8 @@ fn lower_test_shader(native: &NativeProgram, parts: &[(crate::FourCC, &[u8])]) -
     let res = resource::track(&p, &native.layout, native.stage).unwrap();
     let io = io::raise(&p, native).unwrap();
     let st = structure::structure(&p).unwrap();
-    let shader = super::emit(&container, native, &p, &st, &io, &res).expect("emit");
+    let shader =
+        super::emit(&container, native, &p, &st, &io, &res, super::Target::ANY).expect("emit");
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
