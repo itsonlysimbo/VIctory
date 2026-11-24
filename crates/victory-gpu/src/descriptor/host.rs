@@ -17,7 +17,8 @@ pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
-    /// Slots mirroring the title's; view heaps have [`DYNAMIC`] more.
+    /// Slots mirroring the title's; view heaps have [`DYNAMIC`] more, then
+    /// their guard slot ([`HostHeap::guard_slot`]).
     count: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -84,7 +85,8 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
+        // A view heap ends with its guard slot (see [`HostHeap::guard_slot`]).
+        let extra = if sampler { 0 } else { DYNAMIC + 1 };
         let (heap, count) = match make(count + extra) {
             Ok(heap) => (heap, count),
             Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
@@ -238,6 +240,19 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// The slot translated shaders read in place of a computed heap index
+    /// at or past it (a stale buffer can give any index, and one past the
+    /// heap hangs some GPUs): in a view heap its last slot, after the
+    /// dynamic ones, null from the start and never made; in a sampler heap
+    /// its last slot (any sampler reads safely).
+    pub(crate) fn guard_slot(&self) -> u32 {
+        if self.sampler {
+            self.count.saturating_sub(1)
+        } else {
+            self.count + DYNAMIC
+        }
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
