@@ -240,19 +240,21 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// The format a render target or unordered-access texture of `format` is
 /// made in on the host, and that render target views and pipelines name:
 /// `R16G16B16A16_FLOAT` (10) for `R9G9B9E5_SHAREDEXP` (67) and
-/// `R8G8B8A8_UNORM` (28) for `B5G5R5A1_UNORM` (86), which PC D3D12 forbids
-/// as a render target or unordered-access resource (86 has no typed
-/// unordered access); else [`pc_format`]. Textures only sampled keep their
+/// `R8G8B8A8_UNORM` (28) for `B5G5R5A1_UNORM` (86) and `B4G4R4A4_UNORM`
+/// (115), which PC D3D12 forbids as a render target or unordered-access
+/// resource (86 has no typed unordered access, 115 is not a required render
+/// target format); else [`pc_format`]. Textures only sampled keep their
 /// format. The stand-ins hold every value of the console format, channel
 /// for channel.
 pub(crate) fn target_format(format: u32) -> u32 {
     const R9G9B9E5_SHAREDEXP: u32 = 67;
     const RGBA16_FLOAT: u32 = 10;
     const B5G5R5A1_UNORM: u32 = 86;
+    const B4G4R4A4_UNORM: u32 = 115;
     const RGBA8_UNORM: u32 = 28;
     match pc_format(format) {
         R9G9B9E5_SHAREDEXP => RGBA16_FLOAT,
-        B5G5R5A1_UNORM => RGBA8_UNORM,
+        B5G5R5A1_UNORM | B4G4R4A4_UNORM => RGBA8_UNORM,
         format => format,
     }
 }
@@ -1968,6 +1970,7 @@ mod tests {
         assert_eq!(target_format(118), 45);
         assert_eq!(pc_format(86), 86);
         assert_eq!(target_format(86), 28);
+        assert_eq!(target_format(115), 28);
     }
 
     #[cfg(windows)]
@@ -1990,7 +1993,7 @@ mod tests {
             flags,
         };
         for (format, flags, expected_host_format) in
-            [(67, 0, 67), (67, 4, 10), (67, 5, 10), (86, 0, 86), (86, 5, 28)]
+            [(67, 0, 67), (67, 4, 10), (67, 5, 10), (86, 0, 86), (86, 5, 28), (115, 1, 28)]
         {
             let d = ResourceDesc { format, ..tex_desc(flags) };
             let mut out = std::ptr::null();
