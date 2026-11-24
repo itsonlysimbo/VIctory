@@ -41,6 +41,7 @@ pub(crate) struct Lowered {
 
 pub(crate) struct Parts<'a> {
     pub native: &'a NativeProgram,
+    pub psv: Option<&'a [u8]>,
     pub p: &'a Program,
     pub st: &'a Structured,
     pub io: &'a Io,
@@ -2870,19 +2871,17 @@ impl<'a> Lower<'a> {
                     _ => None,
                 })
             });
-        let Some((at, first)) = use_at else {
-            return Err("a descriptor read only as data");
-        };
+        let first = use_at.map_or(0, |(_, first)| first);
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
+        let ui = use_at.map(|(at, _)| &self.x.p.blocks[at.0].insts[at.1]);
+        let un = ui.map_or("", Inst::name);
         let uav = un.contains("store")
             || un.contains("atomic")
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
-            Fields::Image { dim, .. } => {
+        let (props, image) = match ui.map(|i| &i.fields) {
+            Some(Fields::Image { dim, .. }) => {
                 let kind = match dim {
                     0 => 1,
                     1 => 2,
@@ -2893,7 +2892,7 @@ impl<'a> Lower<'a> {
                 };
                 ((kind | u, 0x409), Some(kind))
             }
-            Fields::Buffer { idxen, format, .. } => {
+            Some(Fields::Buffer { idxen, format, .. }) => {
                 let stride = used.map_or(0, |u| u.stride);
                 let props = if un.starts_with("buffer_load_format")
                     || un.starts_with("buffer_store_format")
@@ -2908,6 +2907,30 @@ impl<'a> Lower<'a> {
                     return Err("a constant buffer's descriptor read as data");
                 }
                 (props, None)
+            }
+            None => {
+                // The shader may only inspect NUM_RECORDS. Use an exact
+                // statically addressed four-dword buffer binding, never the
+                // nearest earlier entry or a dynamically indexed range.
+                let address = self
+                    .scalar
+                    .get(&site)
+                    .ok_or("a descriptor read only as data")?;
+                let Some(binding) = used.filter(|b| {
+                    count == 4
+                        && address.dynamic.is_none()
+                        && b.table_offset_dwords.checked_mul(4) == Some(address.offset)
+                        && b.dwords == 4
+                        && matches!(b.kind, ResourceType::Srv | ResourceType::Uav)
+                        && (4..=2048).contains(&b.stride)
+                        && b.stride.is_multiple_of(4)
+                        && self.x.psv.is_some_and(|part| {
+                            super::declares_structured_buffer(part, b.lower_bound, uav)
+                        })
+                }) else {
+                    return Err("a descriptor read only as data");
+                };
+                ((12 | u, binding.stride), None)
             }
             _ => return Err("a scalar memory read as data"),
         };
@@ -6585,6 +6608,7 @@ mod tests {
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
         lower(&Parts {
+            psv: None,
             native: &native,
             p: &p,
             st: &st,
