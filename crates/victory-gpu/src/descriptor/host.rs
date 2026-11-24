@@ -996,6 +996,24 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    // The console's 16-bit depth kept as a plain 16-bit texture
+    // (`resource::host_texture`): its depth views read the 16 bits; its
+    // stencil has no host copy.
+    if own == 53 && d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 == 0 {
+        match view {
+            45 | 46 => {
+                if let Some(format) = format {
+                    format.0 = 56;
+                }
+                return true;
+            }
+            47 => {
+                once!(view, "a stencil view of a console depth kept without stencil");
+                return false;
+            }
+            _ => {}
+        }
+    }
     if view == 0 {
         return !typeless;
     }

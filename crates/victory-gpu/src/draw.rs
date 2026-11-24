@@ -308,7 +308,8 @@ impl State {
         self.depth = 0;
         self.depth_handle = depth;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
-            let texture = crate::resource::host_resource(record.resource)?;
+            let texture = crate::resource::host_resource(record.resource)
+                .filter(|t| crate::resource::is_depth_target(t))?;
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);

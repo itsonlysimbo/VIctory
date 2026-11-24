@@ -31,6 +31,10 @@ pub(crate) struct GraphicsState {
     pub(crate) topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE,
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
     depth_format: DXGI_FORMAT,
+    /// The title's depth format is the console's 16-bit depth with
+    /// stencil, which titles fill from compute shaders: a host depth
+    /// buffer cannot also be written as an unordered-access view.
+    console_depth: bool,
     samples: DXGI_SAMPLE_DESC,
 }
 
@@ -81,6 +85,7 @@ impl Default for GraphicsState {
             topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED,
             targets: D3D12_RT_FORMAT_ARRAY::default(),
             depth_format: DXGI_FORMAT_UNKNOWN,
+            console_depth: false,
             samples: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -162,6 +167,7 @@ impl GraphicsState {
                 16 => {
                     let f = data.cast::<u32>().read_unaligned();
                     self.depth_format = DXGI_FORMAT(crate::resource::pc_format(f) as i32);
+                    self.console_depth = (118..=120).contains(&f);
                 }
                 17 => self.samples = data.cast::<DXGI_SAMPLE_DESC>().read_unaligned(),
                 _ => {}
@@ -532,6 +538,19 @@ impl HostPipeline {
         } else {
             None
         };
+        // shortcut: a test that only reads the console's 16-bit depth is
+        // dropped: titles fill it from compute shaders, so the host keeps it
+        // as a plain 16-bit texture that cannot be a depth target
+        // (`resource::host_texture`). The title's light rectangles
+        // then shade some pixels the test would have culled.
+        let mut g_depth = g.depth;
+        let mut dsv_format = g.depth_format;
+        if g.console_depth && g.depth.DepthWriteMask.0 == 0 {
+            g_depth.DepthEnable = false.into();
+            if !g.depth.StencilEnable.as_bool() {
+                dsv_format = DXGI_FORMAT_UNKNOWN;
+            }
+        }
         let gs_code = gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
             D3D12_SHADER_BYTECODE {
                 pShaderBytecode: gs.dxil.as_ptr().cast(),
@@ -547,7 +566,7 @@ impl HostPipeline {
             BlendState: g.blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
-            DepthStencilState: g.depth,
+            DepthStencilState: g_depth,
             InputLayout: D3D12_INPUT_LAYOUT_DESC {
                 pInputElementDescs: g.inputs.as_ptr(),
                 NumElements: g.inputs.len() as u32,
@@ -561,7 +580,7 @@ impl HostPipeline {
             },
             NumRenderTargets: g.targets.NumRenderTargets,
             RTVFormats: g.targets.RTFormats,
-            DSVFormat: g.depth_format,
+            DSVFormat: dsv_format,
             SampleDesc: g.samples,
             ..Default::default()
         };
@@ -573,7 +592,13 @@ impl HostPipeline {
                 &code_bytes(&code(1)),
                 &code_bytes(&gs_code),
             ],
-            &state,
+            &if g_depth.DepthEnable != g.depth.DepthEnable
+                || g_depth.StencilEnable != g.depth.StencilEnable
+            {
+                format!("{state} no depth")
+            } else {
+                state.clone()
+            },
         );
         let made = super::library::pipeline(
             &name,

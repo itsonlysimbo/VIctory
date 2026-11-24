@@ -306,6 +306,10 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     let host = host_resource(this)?;
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
+    if format == R16_TYPELESS && (45..=47).contains(&own) {
+        const R16_UNORM: u32 = 56;
+        return Some(R16_UNORM);
+    }
     (format != own && format != target_format(own)).then_some(own)
 }
 
@@ -827,6 +831,17 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
+const R16_TYPELESS: u32 = 53;
+
+/// Whether the host copy of `resource` can be a depth target (not one of
+/// the console depth textures the host keeps as plain 16-bit ones).
+#[cfg(windows)]
+pub(crate) fn is_depth_target(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> bool {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    // SAFETY: a live resource.
+    unsafe { texture.GetDesc() }.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+}
+
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
@@ -848,11 +863,23 @@ fn host_texture(
     // copy if draws write it as a UAV.
     const DEPTH: u32 = 2;
     const UNORDERED: u32 = 4;
-    if d.flags & DEPTH != 0 {
+    // The console's 16-bit depth with stencil, written as unordered access
+    // (the title's light-pass depth, filled by a compute shader
+    // through a 16-bit view): the host copy is a plain 16-bit texture, so
+    // the compute shader's writes reach the shaders that read it. Draws
+    // lose it as a depth target (see `is_depth_target`).
+    let compute_depth = d.flags & (DEPTH | UNORDERED) == DEPTH | UNORDERED
+        && (118..=120).contains(&d.format);
+    if compute_depth {
+        d.flags &= !DEPTH;
+        d.format = R16_TYPELESS;
+    } else if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
     const RENDER_TARGET: u32 = 1;
-    d.format = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+    d.format = if compute_depth {
+        d.format
+    } else if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
         target_format(d.format)
     } else {
         pc_format(d.format)
@@ -870,7 +897,7 @@ fn host_texture(
     }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    let clear_value = (!clear.is_null() && !compute_depth).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
@@ -966,6 +993,13 @@ fn hand_out_resource(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    #[cfg(feature = "diagnostics")]
+    let note = (desc.dimension != BUFFER && desc.width >= 1280 && desc.flags & 7 != 0)
+        .then(|| match &backing {
+            Backing::Address(at) => format!("at {:#x}", *at as u64),
+            Backing::Placed { heap, offset } => format!("heap {heap:?}+{offset:#x}"),
+            _ => "own memory".to_owned(),
+        });
     #[cfg(not(windows))]
     let _ = (state, clear);
     #[cfg(windows)]
@@ -990,7 +1024,22 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
     }
-    object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
+    let made = object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out);
+    #[cfg(feature = "diagnostics")]
+    if let Some(note) = note {
+        // SAFETY: `out` was just written.
+        let handle = unsafe { out.as_ref() }.copied().unwrap_or(std::ptr::null());
+        tracing::info!(
+            resource = ?handle,
+            backing = note,
+            format = desc.format,
+            width = desc.width,
+            height = desc.height,
+            flags = desc.flags,
+            "screen-sized target made"
+        );
+    }
+    made
 }
 
 #[cfg(windows)]

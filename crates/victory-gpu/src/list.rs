@@ -732,7 +732,8 @@ extern "system" fn clear_dsv(
             return;
         };
         let (Some(texture), Some(host)) = (
-            crate::resource::host_resource(record.resource),
+            crate::resource::host_resource(record.resource)
+                .filter(|t| crate::resource::is_depth_target(t)),
             crate::host::host(),
         ) else {
             return;

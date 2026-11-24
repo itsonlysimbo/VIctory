@@ -5,10 +5,10 @@ use super::container::SigElement;
 use crate::dxbc::{Container, FourCC};
 
 /// A geometry shader for the console's rectangle lists after `vs`: each
-/// triangle of three corners `(v0, v1, v2)` becomes `(v0, v1, v2)` and
-/// `(v0, v2, v3)` with `v3 = v0 + v2 - v1` in every float output (integer
-/// outputs keep `v0`'s), as the hardware completes a rectangle from the
-/// vertex shader's outputs.
+/// triangle of three corners `(v0, v1, v2)` gets a second triangle across
+/// its longest edge `(p, q)`, with `v3 = p + q - corner` in every float
+/// output (integer outputs keep `v0`'s), as the hardware completes a
+/// rectangle from the vertex shader's outputs.
 pub fn rect_gs(vs: &HostShader) -> Result<HostShader, String> {
     use super::bitcode::{Attr, Bin, Term};
     let c = Container::parse(&vs.dxil).map_err(|e| e.to_string())?;
@@ -58,20 +58,64 @@ pub fn rect_gs(vs: &HostShader) -> Result<HostShader, String> {
         }
         corners.push(els);
     }
-    let mut fourth = corners[0].clone();
+    // The right angle is at the corner opposite the longest edge in screen
+    // position (`v0` in some titles' rectangles, `v1` in others').
+    let pos = outputs
+        .iter()
+        .position(|e| e.kind == 3)
+        .ok_or("a vertex shader without a position")?;
+    let edge = |s: &mut super::shader::Shader, i: usize, j: usize| {
+        let mut sum = None;
+        for col in 0..2 {
+            let d = s.m.bin(b, Bin::Sub, corners[i][pos][col], corners[j][pos][col]);
+            let sq = s.m.bin(b, Bin::Mul, d, d);
+            sum = Some(match sum {
+                None => sq,
+                Some(t) => s.m.bin(b, Bin::Add, t, sq),
+            });
+        }
+        sum.unwrap()
+    };
+    let (d12, d02, d01) = (edge(&mut s, 1, 2), edge(&mut s, 0, 2), edge(&mut s, 0, 1));
+    const OGE: u8 = 3;
+    let a = s.m.cmp(b, OGE, d12, d02);
+    let c = s.m.cmp(b, OGE, d12, d01);
+    let at0 = s.m.bin(b, Bin::And, a, c);
+    let at1 = s.m.cmp(b, OGE, d02, d01);
+    // The second triangle `(p, q, v3)`: the corner's neighbours swapped.
+    let mut second: [Vec<Vec<super::bitcode::V>>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for (id, e) in outputs.iter().enumerate() {
-        if e.comp != 9 {
-            continue;
-        }
+        let mut ps = Vec::new();
+        let mut qs = Vec::new();
+        let mut fs = Vec::new();
         for col in 0..usize::from(e.cols) {
-            let sum =
-                s.m.bin(b, Bin::Add, corners[0][id][col], corners[2][id][col]);
-            fourth[id][col] = s.m.bin(b, Bin::Sub, sum, corners[1][id][col]);
+            let v = [corners[0][id][col], corners[1][id][col], corners[2][id][col]];
+            // corner v0: (v2, v1); corner v1: (v0, v2); corner v2: (v1, v0)
+            let p1 = s.m.select(b, at1, v[0], v[1]);
+            let p = s.m.select(b, at0, v[2], p1);
+            let q1 = s.m.select(b, at1, v[2], v[0]);
+            let q = s.m.select(b, at0, v[1], q1);
+            let f = if e.comp == 9 {
+                // v3 = p + q - corner
+                let k1 = s.m.select(b, at1, v[1], v[2]);
+                let k = s.m.select(b, at0, v[0], k1);
+                let sum = s.m.bin(b, Bin::Add, p, q);
+                s.m.bin(b, Bin::Sub, sum, k)
+            } else {
+                v[0]
+            };
+            ps.push(p);
+            qs.push(q);
+            fs.push(f);
         }
+        second[0].push(ps);
+        second[1].push(qs);
+        second[2].push(fs);
     }
-    corners.push(fourth);
+    let [p, q, f] = second;
+    corners.extend([p, q, f]);
     let zero = s.m.i8(0);
-    for (k, &v) in [0usize, 1, 2, 0, 2, 3].iter().enumerate() {
+    for (k, v) in [0usize, 1, 2, 3, 4, 5].into_iter().enumerate() {
         for (id, e) in outputs.iter().enumerate() {
             let suffix = if e.comp == 9 { ".f32" } else { ".i32" };
             for col in 0..e.cols {
