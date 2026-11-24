@@ -292,21 +292,41 @@ fn exchanges_inside_a_branch_one_half_skips() {
     });
 }
 
-/// Groups of several console waves need the halves to meet without a
-/// group barrier: not yet.
+/// Groups of several console waves: the halves of each console wave meet
+/// pairwise (a group barrier would wait for console waves elsewhere). Lane
+/// t reads lane 40 of its own console wave, in the other half.
 #[test]
-fn console_flow_is_for_one_console_wave_per_group() {
+fn console_flow_runs_groups_of_several_console_waves() {
     let body = [
         0xD760_0009,
         0x0001_5100, // v_readlane_b32 s9, v0, 40
         0x7E04_0209, // v_mov_b32 v2, s9
     ];
-    let nvidia = super::Target {
-        lanes_min: 32,
-        lanes_max: 32,
-    };
-    assert!(emit_for(&program(&body, 64), nvidia).is_ok());
-    assert!(emit_for(&program(&body, 128), nvidia).is_err());
+    for threads in [128, 256] {
+        console_flow_case("readlane(40)", &body, threads, |t| (t & !63) + 40);
+    }
+}
+
+/// Only the first console wave of the group takes the branch (lanes below
+/// 20), and reads a lane inside it: the other console waves never reach
+/// that exchange, which a group barrier would wait for.
+#[test]
+fn console_waves_of_a_group_branch_apart() {
+    let body = [
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0003, // s_cbranch_execz +3
+        0xD760_0009,
+        0x0001_1500, // v_readlane_b32 s9, v0, 10
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ];
+    for threads in [128, 192] {
+        console_flow_case("if (t < 20) v2 = readlane(10)", &body, threads, |t| {
+            if t < 20 { 10 } else { 1 }
+        });
+    }
 }
 
 /// A loop lane t runs t times, with a lane read of the other half in
@@ -336,6 +356,13 @@ fn loops_run_while_any_lane_of_the_console_wave_does() {
         0x4A04_0409, // v_add_nc_u32 v2, s9, v2
     ];
     console_flow_case("loop t times reading lane 40", &body, 64, |t| t + 40);
+    // Console waves of one group loop different counts (lane t, t times),
+    // each reading lane 40 of its own.
+    for threads in [128, 256] {
+        console_flow_case("loop t times reading lane 40", &body, threads, |t| {
+            t + (t & !63) + 40
+        });
+    }
 }
 
 /// DPP's row mask names the console's rows: with `row_mask:0x3` only

@@ -87,6 +87,10 @@ pub(crate) struct Parts<'a> {
 ///   the scalars set inside. One host wave is the console wave here, so
 ///   nothing is exchanged. If the console flow cannot lower such a program
 ///   it keeps the per-lane form ([`Parts::per_lane_only`]).
+/// How often a half of a console wave checks for its partner at an
+/// exchange before giving up (a hang guard: the partner always comes).
+const PAIR_SPIN_LIMIT: u32 = 1 << 22;
+
 pub(crate) const CONSOLE_FLOW: &str = "a wave64 program whose halves exchange lanes (console flow)";
 
 enum Stop {
@@ -245,6 +249,10 @@ struct Lower<'a> {
     console_flat: Option<V>,
     /// Group-shared slots the two halves exchange a dword through.
     xchg: Option<V>,
+    /// Groups of more than one console wave: per console wave, the slots
+    /// its halves exchange through (by half and parity) and each half's
+    /// exchange count (see [`Self::exchange_pair`]).
+    pair: Option<(V, V)>,
     /// Retry a compute shader with numeric selects only when the normal
     /// translation needs one. Unused selects need no fixed wave size.
     numeric_selects: bool,
@@ -599,7 +607,16 @@ impl<'a> Lower<'a> {
             let needs_wave64 =
                 (console_lanes || one_wave && s.lds_dwords > 0) && !split && x.native.wave64;
             if needs_wave64 && !x.target.runs(64) {
-                no_console_flow = if cs.threads.iter().product::<u32>() > 64 {
+                let threads = cs.threads.iter().product::<u32>();
+                // The pairwise exchanges' slots: 6 dwords per console wave.
+                let pair_bytes = if threads > 64 { threads / 64 * 24 } else { 0 };
+                no_console_flow = if threads > 64
+                    && s.lds_dwords * 4 + pair_bytes > 32768
+                {
+                    Some(
+                        "group-shared memory for console wave64 exchanges past 32 KiB on a host without 64-lane waves",
+                    )
+                } else if threads > 64 && threads % 64 != 0 {
                     Some(
                         "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
                     )
@@ -728,6 +745,7 @@ impl<'a> Lower<'a> {
             no_console_flow,
             console_flat: None,
             xchg: None,
+            pair: None,
             numeric_selects,
             flat: None,
             no_barrier,
@@ -1160,6 +1178,14 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
+        // Exchanges between the halves of a console wave split the block
+        // they are in ([`Self::exchange_pair`]); the entry block, which
+        // must come first, then only branches to the first block.
+        if self.pairwise() {
+            let first = self.s.m.new_block();
+            self.s.m.terminate(self.s.entry, Term::Br(first));
+            self.block[order[0]] = Some(first);
+        }
         // Loop headers count iterations (`LOOP_LIMIT`).
         for &b in &order {
             let header = p.blocks[b]
@@ -1221,6 +1247,9 @@ impl<'a> Lower<'a> {
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
+            // The branch test may have gone on in a later block (console
+            // waves exchanging through [`Self::exchange_pair`]).
+            self.tail[b] = Some(self.cur);
         }
         self.fill_phis()?;
         let user_data = self.user_reads.values().copied().collect();
@@ -1529,6 +1558,13 @@ impl<'a> Lower<'a> {
                 Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
             };
             let bit = self.boolean(m, at)?;
+            if self.pairwise() && at != self.cur {
+                // Every lane runs every block, so the bits taken where the
+                // mask is written exchange here alike. Kept only where made.
+                let c = self.cur;
+                let xy = self.console_ballot(c, bit);
+                return Ok(if high { xy.1 } else { xy.0 });
+            }
             let xy = self.console_ballot(at, bit);
             self.ballots.insert(lo, xy);
             return Ok(if high { xy.1 } else { xy.0 });
@@ -1579,7 +1615,22 @@ impl<'a> Lower<'a> {
     /// (SCC of the operation writing it): its ballot is not zero.
     fn mask_any(&mut self, lo: Value) -> Result<V, Why> {
         let x = self.mask_dword(lo)?;
-        let (_, y) = self.ballots[&lo];
+        let y = match self.ballots.get(&lo) {
+            Some(&(_, y)) => y,
+            // Not kept (see `mask_dword`): the high word likewise.
+            None => {
+                let hi = self
+                    .x
+                    .st
+                    .highs
+                    .iter()
+                    .find_map(|(&h, &l)| (l == lo).then_some(h));
+                match hi {
+                    Some(h) => self.mask_dword(h)?,
+                    None => self.s.m.i32(0),
+                }
+            }
+        };
         let c = self.cur;
         let any = if self.x.p.wave64 {
             self.s.m.bin(c, Bin::Or, x, y)
@@ -2588,9 +2639,13 @@ impl<'a> Lower<'a> {
             // next one. The halves are two host waves, both here (console
             // flow): a group barrier before each LDS access puts it after
             // every earlier one, whichever half made it.
-            let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
-            self.s
-                .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            if self.pairwise() {
+                self.pair_sync();
+            } else {
+                let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
+                self.s
+                    .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            }
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         // shortcut: LDS addresses are taken as dword-aligned and in bounds
@@ -7665,6 +7720,10 @@ impl<'a> Lower<'a> {
         if threads <= 32 {
             return (x, z);
         }
+        if self.pairwise() {
+            debug_assert_eq!(at, self.cur);
+            return self.exchange_pair(x);
+        }
         let (_, half) = self.console_lane();
         let slots = match self.xchg {
             Some(g) => g,
@@ -7691,6 +7750,129 @@ impl<'a> Lower<'a> {
         self.s
             .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         (lo, hi)
+    }
+
+    /// Console flow in a group of more than one console wave: the halves
+    /// of each console wave exchange values pairwise (a group barrier would
+    /// wait for console waves that branch elsewhere).
+    fn pairwise(&self) -> bool {
+        self.console_cf
+            && self.split
+            && self
+                .s
+                .threads
+                .is_some_and(|t| t.iter().product::<u32>() > 64)
+    }
+
+    /// This lane's console wave in the group and its half of it.
+    fn console_wave_half(&mut self) -> (V, V) {
+        let f = self.console_flat();
+        let (_, half) = self.console_lane();
+        let e = self.s.entry;
+        let k6 = self.s.m.i32(6);
+        (self.s.m.bin(e, Bin::LShr, f, k6), half)
+    }
+
+    /// The group-shared slots of [`Self::exchange_pair`], their counts set
+    /// to 0 at the start of the group.
+    fn pair_slots(&mut self) -> (V, V) {
+        if let Some(p) = self.pair {
+            return p;
+        }
+        let threads: u32 = self.s.threads.expect("compute").iter().product();
+        let waves = threads.div_ceil(64);
+        let i32t = self.s.t.i32;
+        let values = self.s.m.array(waves * 4, i32t);
+        let values = self.s.m.global("pair_values", values, 3);
+        let counts = self.s.m.array(waves * 2, i32t);
+        let counts = self.s.m.global("pair_counts", counts, 3);
+        let (w, half) = self.console_wave_half();
+        let e = self.s.entry;
+        let two = self.s.m.i32(2);
+        let row = self.s.m.bin(e, Bin::Mul, w, two);
+        let mine = self.s.m.bin(e, Bin::Add, row, half);
+        let at = self.s.m.element(e, counts, mine);
+        let z = self.s.m.i32(0);
+        self.s.m.store(e, at, z);
+        // Every thread passes the entry block: the counts are 0 before any
+        // half reads its partner's.
+        let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
+        self.s.op(e, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.pair = Some((values, counts));
+        (values, counts)
+    }
+
+    /// Console flow, more than one console wave per group: each half of
+    /// this lane's console wave gives `x` (the same in all its lanes) and
+    /// both get (the lower half's, the upper half's). A half writes its
+    /// value in the slot of the exchange's parity, counts the exchange,
+    /// and waits for its partner's count to reach its own; the partner is
+    /// then at most one exchange ahead, writing the other parity. The
+    /// block the exchange started in goes on after the wait (its code so
+    /// far moves to a new block that ends in it), so values made in it
+    /// before stay usable. A wait that does not end (a partner that never
+    /// comes) gives up after [`PAIR_SPIN_LIMIT`] tries.
+    fn exchange_pair(&mut self, x: V) -> (V, V) {
+        let (values, counts) = self.pair_slots();
+        let (w, half) = self.console_wave_half();
+        let c = self.cur;
+        let head = self.s.m.new_block();
+        self.s.m.split_head(c, head);
+        for b in self.block.iter_mut() {
+            if *b == Some(c) {
+                *b = Some(head);
+            }
+        }
+        let spin = self.s.m.new_block();
+        let (z, one, two) = (self.s.m.i32(0), self.s.m.i32(1), self.s.m.i32(2));
+        let void = self.s.t.void;
+        // Group-shared memory fence alone (no thread-group sync).
+        let fence = self.s.m.i32(8);
+        let row = self.s.m.bin(head, Bin::Mul, w, two);
+        let mine = self.s.m.bin(head, Bin::Add, row, half);
+        let other_half = self.s.m.bin(head, Bin::Xor, half, one);
+        let other = self.s.m.bin(head, Bin::Add, row, other_half);
+        let my_count = self.s.m.element(head, counts, mine);
+        let old = self.s.m.load(head, my_count);
+        let n = self.s.m.bin(head, Bin::Add, old, one);
+        let parity = self.s.m.bin(head, Bin::And, n, one);
+        let slot = |l: &mut Self, at: usize, h: V| -> V {
+            let i = l.s.m.bin(at, Bin::Add, row, h);
+            let i = l.s.m.bin(at, Bin::Mul, i, two);
+            let i = l.s.m.bin(at, Bin::Add, i, parity);
+            l.s.m.element(at, values, i)
+        };
+        let mine_slot = slot(self, head, half);
+        self.s.m.atomic(head, super::bitcode::Rmw::Xchg, mine_slot, x);
+        self.s.op(head, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        self.s.m.atomic(head, super::bitcode::Rmw::Xchg, my_count, n);
+        self.s.m.terminate(head, Term::Br(spin));
+        // The wait.
+        let tries = self.s.m.phi(spin, self.s.t.i32);
+        let their_count = self.s.m.element(spin, counts, other);
+        let theirs = self.s.m.atomic(spin, super::bitcode::Rmw::Or, their_count, z);
+        let came = self.s.m.cmp(spin, pred::IUGE, theirs, n);
+        let next = self.s.m.bin(spin, Bin::Add, tries, one);
+        let limit = self.s.m.i32(PAIR_SPIN_LIMIT);
+        let tired = self.s.m.cmp(spin, pred::IUGE, next, limit);
+        let leave = self.s.m.bin(spin, Bin::Or, came, tired);
+        self.s.m.set_phi(tries, vec![(z, head), (next, spin)]);
+        self.s.m.terminate(spin, Term::CondBr(leave, c, spin));
+        // Both values, after the partner's write.
+        self.s.op(c, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        let lo_slot = slot(self, c, z);
+        let lo = self.s.m.atomic(c, super::bitcode::Rmw::Or, lo_slot, z);
+        let hi_slot = slot(self, c, one);
+        let hi = self.s.m.atomic(c, super::bitcode::Rmw::Or, hi_slot, z);
+        (lo, hi)
+    }
+
+    /// Console flow in a group of more than one console wave: both halves
+    /// of this lane's console wave are here before either goes on (an LDS
+    /// access after every earlier one of either half).
+    fn pair_sync(&mut self) {
+        let z = self.s.m.i32(0);
+        self.exchange_pair(z);
     }
 
     /// A forward edge into loop header `to` (from DXIL block `via`) starts

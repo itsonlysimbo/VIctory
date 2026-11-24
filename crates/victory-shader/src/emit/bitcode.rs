@@ -346,6 +346,34 @@ impl Module {
         self.blocks.len() - 1
     }
 
+    /// Moves the phis and body of `from` (not yet terminated) to the empty
+    /// block `to`, and every branch to `from` to `to`: `from` is left empty
+    /// to go on after code that `to` now ends with.
+    pub fn split_head(&mut self, from: usize, to: usize) {
+        debug_assert!(self.blocks[from].term.is_none());
+        let phis = std::mem::take(&mut self.blocks[from].phis);
+        let body = std::mem::take(&mut self.blocks[from].body);
+        self.blocks[to].phis = phis;
+        self.blocks[to].body = body;
+        let swap = |b: &mut usize| {
+            if *b == from {
+                *b = to;
+            }
+        };
+        for blk in &mut self.blocks {
+            match &mut blk.term {
+                Some(Term::Br(t)) => swap(t),
+                Some(Term::CondBr(_, t, f)) => {
+                    swap(t);
+                    swap(f);
+                }
+                _ => {}
+            }
+        }
+        // Phis naming `from` as a predecessor stay: the block that will
+        // branch to them keeps the number.
+    }
+
     pub fn type_of(&self, v: V) -> Ty {
         match v {
             V::Global(i) => self.globals[i as usize].ptr,
