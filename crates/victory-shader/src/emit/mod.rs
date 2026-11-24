@@ -108,7 +108,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_TABLE_DWORDS, STRIDE_SPACE, USER_DATA_SPACE};
 
-/// The loop limit without an override: 2^20.
+/// The loop limit without an override: 2^12.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
 /// The iteration count after which a translated loop is left, per lane and

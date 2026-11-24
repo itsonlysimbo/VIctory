@@ -295,8 +295,15 @@ struct Lower<'a> {
 /// zeros) can make that four billion iterations, which hangs the host GPU
 /// until the driver resets it. A lane that reaches the limit leaves the
 /// program as killed (a pixel discards).
+///
+/// 2^12, not more: the limit applies per loop, so loops nested in loops
+/// multiply it. With 2^20, single mesh groups and 8,192-group dispatches
+/// of the title's world ran for 1.8-3 s each on an RTX 4070 (no
+/// preemption inside a group), and the host reset the device after
+/// 30-80 s in the world; with 2^12 the same frames take about 200 ms on
+/// the GPU and the device stays up.
 // shortcut: a genuine loop of more iterations than this is cut short too.
-pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+pub(super) const LOOP_LIMIT: u32 = 1 << 12;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
