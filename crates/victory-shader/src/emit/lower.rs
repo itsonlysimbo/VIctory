@@ -6814,7 +6814,10 @@ impl<'a> Lower<'a> {
     }
 
     /// Mesh: `exp prim` as the lane's primitive. Bit 31 culls it (all
-    /// indices 0: no area).
+    /// indices 0: no area). So does an index past the declared vertices:
+    /// the host's mesh output counts are those maxima, and an index past
+    /// them is undefined there (it can stall the GPU without a fault),
+    /// where the console reads whatever its vertex memory holds.
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
@@ -6834,15 +6837,29 @@ impl<'a> Lower<'a> {
         } else {
             guard
         };
+        // The declared maxima (lowered to fit D3D12's 32 KiB if they had
+        // to be), not the console's.
+        let vertices = self
+            .s
+            .mesh
+            .map(|m| m.max_vertices)
+            .ok_or("a primitive export outside a mesh program")?;
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![flat];
+        let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
+        let n = self.s.m.i32(vertices);
+        let mut indices = Vec::new();
         for k in 0..3 {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
+            let past = self.s.m.cmp(c, pred::IUGE, i, n);
+            culled = self.s.m.bin(c, Bin::Or, culled, past);
+            indices.push(i);
+        }
+        let mut args = vec![self.mesh_thread()];
+        for i in indices {
             args.push(self.s.m.select(c, culled, z, i));
         }
         let void = self.s.t.void;

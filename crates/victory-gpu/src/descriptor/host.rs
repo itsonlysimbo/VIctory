@@ -76,8 +76,10 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// took until it is reset (its submissions have run) or released.
 const DYNAMIC: u32 = 1 << 19;
 /// Smaller dynamic reserve when the host caps the whole view heap at
-/// [`PORTABLE_VIEWS`].
-const DYNAMIC_CAPPED: u32 = 1 << 16;
+/// [`PORTABLE_VIEWS`] (NVIDIA). World frames ran out of 2^16 there; 2^18
+/// leaves 737,856 title slots below the cap (tables past them are made
+/// afresh too).
+const DYNAMIC_CAPPED: u32 = 1 << 18;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {

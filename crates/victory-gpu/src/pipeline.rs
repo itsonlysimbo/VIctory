@@ -82,6 +82,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())
         .or_insert_with(|| {
+            #[cfg(feature = "diagnostics")]
+            dump_container(&full.to_hex()[..16], bytes);
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
@@ -91,6 +93,29 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             })
         })
         .clone()
+}
+
+/// Debugging aid: `VICTORY_DUMP_SHADERS=<hash>,...` with
+/// `VICTORY_DUMP_DIR=<dir>` saves those containers (16-digit hashes, as
+/// logged) to `<dir>\<hash>.bin` when the title first passes them.
+#[cfg(feature = "diagnostics")]
+fn dump_container(hash: &str, bytes: &[u8]) {
+    static WANTED: std::sync::LazyLock<Option<(Vec<String>, std::path::PathBuf)>> =
+        std::sync::LazyLock::new(|| {
+            let hashes = std::env::var("VICTORY_DUMP_SHADERS").ok()?;
+            let dir = std::env::var_os("VICTORY_DUMP_DIR")?;
+            let hashes = hashes.split(',').map(|h| h.trim().to_ascii_lowercase()).collect();
+            Some((hashes, dir.into()))
+        });
+    let Some((hashes, dir)) = &*WANTED else { return };
+    if !hashes.iter().any(|h| h == hash) {
+        return;
+    }
+    let path = dir.join(format!("{hash}.bin"));
+    match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, bytes)) {
+        Ok(()) => tracing::warn!(path = %path.display(), "shader container saved"),
+        Err(e) => tracing::warn!(error = %e, hash, "shader container not saved"),
+    }
 }
 
 /// A translated shader and the console resources its code reads.

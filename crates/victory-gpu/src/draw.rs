@@ -554,6 +554,7 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        serialize(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -606,6 +607,7 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    serialize(list);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -867,6 +869,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            serialize(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -954,6 +957,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            serialize(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1069,6 +1073,7 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        serialize(list);
         crate::indirect::done(list, &args);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1077,6 +1082,39 @@ impl State {
         }
         true
     }
+}
+
+/// Debugging aid: with `VICTORY_SERIALIZE_DRAWS` (diagnostics builds), a
+/// global UAV barrier after every draw, dispatch and indirect execution,
+/// so the GPU finishes each before the next starts and a device-removed
+/// report's last completed breadcrumb names the command that hung.
+#[inline]
+fn serialize(list: &HostList) {
+    #[cfg(feature = "diagnostics")]
+    {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            let on = std::env::var_os("VICTORY_SERIALIZE_DRAWS").is_some();
+            if on {
+                tracing::warn!("VICTORY_SERIALIZE_DRAWS: a barrier after every draw and dispatch");
+            }
+            on
+        });
+        if *ON {
+            let barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            };
+            // SAFETY: an open list; a global UAV barrier names no resource.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = list;
 }
 
 /// The host command signature for one argument of `kind` with records
