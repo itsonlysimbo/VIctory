@@ -19,7 +19,10 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
-use crate::host::HostList;
+use crate::host::{
+    BUFFER_INDEX, BUFFER_INDIRECT, BUFFER_SHADER_RESOURCE, BUFFER_UAV, BUFFER_VERTEX_CONSTANT,
+    HostList,
+};
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
@@ -142,6 +145,12 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        // Read by the draw or dispatch: the copy must be in a state it can
+        // be, not the one an earlier pass that wrote it left it in.
+        list.want_buffer(
+            &shadow,
+            if srv { BUFFER_SHADER_RESOURCE } else { BUFFER_VERTEX_CONSTANT },
+        );
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -363,6 +372,10 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            // Vertex data a compute pass wrote is in unordered access: the
+            // copy is moved before the list binds it (a bound buffer in a
+            // state that is not a vertex buffer's removes the device).
+            list.buffer_state(&shadow, BUFFER_VERTEX_CONSTANT);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -381,6 +394,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_state(&shadow, BUFFER_INDEX);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -449,6 +463,10 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             let Some(made) = self.tables(list, &t.used, compute) else {
+                // The uses already named must not carry into the next
+                // draw's settlement (a write here would leave a copy the
+                // next draw reads in unordered access).
+                list.settle_buffers();
                 return false;
             };
             if let Some((param, dwords)) = stage.user_data {
@@ -499,6 +517,9 @@ impl State {
                 }
             }
         }
+        // Every buffer copy the stages read or write, each in the one state
+        // its uses allow together.
+        list.settle_buffers();
         true
     }
 
@@ -997,7 +1018,7 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        if !crate::indirect::bound(list, &args, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
@@ -1013,7 +1034,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, &args);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1025,6 +1046,13 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        // The arguments and the count are read as indirect arguments: put
+        // back in that state if the draw or dispatch moved them (one buffer
+        // copy may hold the arguments and what the pass reads or writes).
+        list.buffer_state(&args, BUFFER_INDIRECT);
+        if let Some((s, _)) = &counter {
+            list.buffer_state(s, BUFFER_INDIRECT);
+        }
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
@@ -1037,7 +1065,7 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, &args);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1101,6 +1129,12 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
+        }
+        match u.kind {
+            ResourceType::Uav => list.want_buffer(&shadow, BUFFER_UAV),
+            ResourceType::Srv => list.want_buffer(&shadow, BUFFER_SHADER_RESOURCE),
+            ResourceType::Cbv => list.want_buffer(&shadow, BUFFER_VERTEX_CONSTANT),
+            _ => {}
         }
     }
     match (view, u.kind) {
